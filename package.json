@@ -1,0 +1,24 @@
+{
+  "name": "agentdock",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Durable core for the AgentDock coding-agent orchestrator",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "bin": {
+    "agentdock": "dist/src/app/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test dist/tests/**/*.test.js",
+    "migrate": "npm run build --silent && node dist/src/app/cli.js migrate",
+    "cli": "npm run build --silent && node dist/src/app/cli.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "typescript": "^5.7.3"
+  }
+}

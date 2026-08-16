@@ -1,16 +1,18 @@
 import type { CodingAgent, AgentRunContext, AgentRunOutcome } from "./coding-agent.js";
 import type { ProcessRunner } from "./process-runner.js";
+import { SecretIsolation } from "../security/permissions.js";
 
 /**
  * Environment policy: coding agents run with a controlled environment rather
  * than blindly inheriting the orchestrator's full environment, so agent
- * credentials and service secrets stay isolated.
+ * credentials and service secrets stay isolated. Credential-shaped variables
+ * are stripped even if allowlisted by mistake.
  */
 export function agentEnvironment(base: NodeJS.ProcessEnv, extra: Record<string, string> = {}): Record<string, string> {
   const allowed = ["PATH", "HOME", "LANG", "LC_ALL", "TERM", "TMPDIR", "TMP", "TEMP", "SHELL", "USER", "LOGNAME", "XDG_CONFIG_HOME", "NODE_ENV"];
   const env: Record<string, string> = {};
   for (const key of allowed) if (base[key] !== undefined) env[key] = base[key]!;
-  return { ...env, ...extra };
+  return SecretIsolation.sanitize({ ...env, ...extra });
 }
 
 export interface EnvCodingAgentOptions {

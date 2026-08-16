@@ -13,6 +13,8 @@ import { ClaudeAgent, CodexAgent } from "../runtime/env-agents.js";
 import type { CodingAgent } from "../runtime/coding-agent.js";
 import { AgentThreadManager } from "../runtime/agent-thread-manager.js";
 import { WorkflowEngine } from "../workflows/workflow-engine.js";
+import { MetricsService, BudgetGuard } from "../security/metrics.js";
+import { AuditLog } from "../security/permissions.js";
 import { resolve } from "node:path";
 
 export type Application = ReturnType<typeof createApplication>;
@@ -26,6 +28,7 @@ export function createApplication(db:Database, options:{ agents?: Record<string,
   const runtime=new AgentThreadManager(agentThreadRepository,artifactRepository,taskRepository,(provider)=>{ const agent=agents[provider]; if(!agent) throw new Error(`Unknown agent provider: ${provider}`); return agent; },artifactRoot);
   const tasks=new TaskService(taskRepository,projectRepository);
   const worktrees=new WorktreeManager(taskRepository,projectRepository,git);
+  const metrics=new MetricsService(db);
   return {
     projects:new ProjectService(projectRepository),
     tasks,
@@ -34,6 +37,9 @@ export function createApplication(db:Database, options:{ agents?: Record<string,
     workflows:new WorkflowEngine(workflowRepository,taskRepository,projectRepository,runtime,artifactRepository,runner),
     /** Shared runner so cancellation reaches the same processes the app spawned. */
     processRunner:runner,
+    metrics,
+    budget:new BudgetGuard(db,metrics),
+    audit:new AuditLog(db),
     repositories:{projects:projectRepository,tasks:taskRepository,workflows:workflowRepository,agentThreads:agentThreadRepository,artifacts:artifactRepository},
   };
 }

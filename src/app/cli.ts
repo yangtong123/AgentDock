@@ -35,6 +35,9 @@ Usage:
   agentdock github create-pr --task-id ID --title TEXT
   agentdock github refresh --task-id ID
   agentdock github reviews --task-id ID
+  agentdock metrics summary
+  agentdock metrics usage --task-id ID
+  agentdock audit [--task-id ID] [--limit 50]
 
 Set AGENTDOCK_DB to choose the database (default: .agentdock/agentdock.db).`); process.exit(1); }
 
@@ -98,5 +101,8 @@ try {
     const github=new GitHubService(db,new GhCliAdapter(),app.repositories.tasks,app.repositories.projects);
     console.log(JSON.stringify(await github.ingestReviews(option(args,"task-id")!),null,2));
   }
+  else if(resource==="metrics"&&action==="summary") console.log(JSON.stringify({steps:app.metrics.stepMetrics(),tasks:app.metrics.taskMetrics()},null,2));
+  else if(resource==="metrics"&&action==="usage") console.log(JSON.stringify(app.metrics.usageForTask(option(args,"task-id")!),null,2));
+  else if(resource==="audit") { const taskId=option(args,"task-id",false); console.log(JSON.stringify(app.audit.list({...(taskId===undefined?{}:{taskId}),limit:Number(option(args,"limit",false)??50)}),null,2)); }
   else usage();
 } catch(error) { console.error(error instanceof Error?error.message:error); process.exitCode=1; } finally { db.close(); }

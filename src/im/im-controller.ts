@@ -2,22 +2,26 @@ import type { Database } from "../db/database.js";
 import type { Application } from "../app/application.js";
 import type { ImAdapter, ImCommand, ImReply } from "./im-adapter.js";
 import { parseCommand } from "./command-parser.js";
+import { AuditLog } from "../security/permissions.js";
 
 /**
  * Domain-level controller shared by every IM adapter (Telegram now, Feishu
  * later). IM input becomes ImCommands; this is the only place those touch
  * domain services. Replies route back through the originating adapter only —
  * cross-IM visibility comes from the shared durable task state, not from
- * broadcasting chat ids across platforms.
+ * broadcasting chat ids across platforms. Every command lands in the audit log.
  */
 export class ImController {
   private readonly adapters = new Map<string, ImAdapter>();
+  private readonly audit: AuditLog;
 
   constructor(
     private readonly db: Database,
     private readonly app: Application,
     private readonly now = () => new Date().toISOString(),
-  ) {}
+  ) {
+    this.audit = new AuditLog(db, now);
+  }
 
   register(adapter: ImAdapter): void {
     adapter.onMessage(async (message) => {
@@ -38,6 +42,10 @@ export class ImController {
 
   /** handle() with no adapter routes to every adapter (used by tests and internal callers). */
   async handle(command: ImCommand, originAdapter?: string): Promise<ImReply> {
+    const taskId = "taskId" in command ? command.taskId : undefined;
+    const entry: { actor: string; action: string; detail: Record<string, unknown> } & { taskId?: string } = { actor: command.conversationId, action: command.type, detail: { originAdapter: originAdapter ?? "internal" } };
+    if (taskId !== undefined) entry.taskId = taskId;
+    this.audit.record(entry);
     const reply = await this.dispatch(command);
     if (originAdapter !== undefined) {
       const adapter = this.adapters.get(originAdapter);

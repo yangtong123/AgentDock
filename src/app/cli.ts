@@ -4,11 +4,14 @@ import { openDatabase } from "../db/database.js";
 import { createApplication } from "./application.js";
 import { expandPreset } from "../workflows/presets.js";
 import type { StepType } from "../shared/domain.js";
+import { ImController } from "../im/im-controller.js";
+import { TelegramAdapter } from "../im/telegram-adapter.js";
 
 function option(args:string[],name:string,required=true):string|undefined { const i=args.indexOf(`--${name}`); const value=i>=0?args[i+1]:undefined; if(required&&!value) throw new Error(`Missing --${name}`); return value; }
 function has(args:string[],name:string):boolean { return args.includes(`--${name}`); }
-function usage():never { console.error(`AgentDock V0.4
+function usage():never { console.error(`AgentDock V0.5
 Usage:
+  agentdock serve (long-running: Telegram adapter when TELEGRAM_BOT_TOKEN is set)
   agentdock migrate
   agentdock project add --name NAME --repo-path PATH --worktree-root PATH [--base-branch main] [--max-concurrent-tasks 1] [--verify-command JSON_ARGV]
   agentdock project list
@@ -44,10 +47,18 @@ function parseProviderOverrides(args:string[]): Partial<Record<StepType,string>>
 }
 
 const args=process.argv.slice(2); if(args.includes("--help")||args.length===0) usage();
-const db=openDatabase(resolve(process.env.AGENTDOCK_DB??".agentdock/agentdock.db"));
+const db=openDatabase(resolve(process.env.AGENTDOCK_DB??"./.agentdock/agentdock.db"));
 try {
   const app=createApplication(db); const [resource,action]=args;
-  if(resource==="migrate") console.log("Migrations applied.");
+  if(resource==="serve") {
+    const telegramToken=process.env.TELEGRAM_BOT_TOKEN;
+    const controller=new ImController(db,app);
+    if(telegramToken) controller.register(new TelegramAdapter(telegramToken));
+    await controller.startAll();
+    console.log(`AgentDock serving (${telegramToken?"telegram":"no IM adapters configured"}). Ctrl-C to stop.`);
+    await new Promise(()=>{});
+  }
+  else if(resource==="migrate") console.log("Migrations applied.");
   else if(resource==="project"&&action==="add") {
     const baseBranch=option(args,"base-branch",false);
     const verifyCommandRaw=option(args,"verify-command",false);

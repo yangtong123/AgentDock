@@ -6,6 +6,8 @@ import { expandPreset } from "../workflows/presets.js";
 import type { StepType } from "../shared/domain.js";
 import { ImController } from "../im/im-controller.js";
 import { TelegramAdapter } from "../im/telegram-adapter.js";
+import { GitHubService } from "../github/github-service.js";
+import { GhCliAdapter } from "../github/gh-cli-adapter.js";
 
 function option(args:string[],name:string,required=true):string|undefined { const i=args.indexOf(`--${name}`); const value=i>=0?args[i+1]:undefined; if(required&&!value) throw new Error(`Missing --${name}`); return value; }
 function has(args:string[],name:string):boolean { return args.includes(`--${name}`); }
@@ -30,6 +32,9 @@ Usage:
   agentdock workflow status --run-id ID
   agentdock workflow approve --run-id ID [--reject]
   agentdock workflow cancel --run-id ID
+  agentdock github create-pr --task-id ID --title TEXT
+  agentdock github refresh --task-id ID
+  agentdock github reviews --task-id ID
 
 Set AGENTDOCK_DB to choose the database (default: .agentdock/agentdock.db).`); process.exit(1); }
 
@@ -81,5 +86,17 @@ try {
   else if(resource==="workflow"&&action==="status") console.log(JSON.stringify(app.workflows.status(option(args,"run-id")!),null,2));
   else if(resource==="workflow"&&action==="approve") console.log(JSON.stringify(app.workflows.approve(option(args,"run-id")!,!has(args,"reject")),null,2));
   else if(resource==="workflow"&&action==="cancel") console.log(JSON.stringify(app.workflows.cancel(option(args,"run-id")!),null,2));
+  else if(resource==="github"&&action==="create-pr") {
+    const github=new GitHubService(db,new GhCliAdapter(),app.repositories.tasks,app.repositories.projects);
+    console.log(JSON.stringify(await github.createDraftPr({taskId:option(args,"task-id")!,title:option(args,"title")!}),null,2));
+  }
+  else if(resource==="github"&&action==="refresh") {
+    const github=new GitHubService(db,new GhCliAdapter(),app.repositories.tasks,app.repositories.projects);
+    console.log(JSON.stringify(await github.refresh(option(args,"task-id")!),null,2));
+  }
+  else if(resource==="github"&&action==="reviews") {
+    const github=new GitHubService(db,new GhCliAdapter(),app.repositories.tasks,app.repositories.projects);
+    console.log(JSON.stringify(await github.ingestReviews(option(args,"task-id")!),null,2));
+  }
   else usage();
 } catch(error) { console.error(error instanceof Error?error.message:error); process.exitCode=1; } finally { db.close(); }

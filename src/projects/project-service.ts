@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Project, ProjectStatus } from "../shared/domain.js";
-import { ValidationError } from "../shared/domain.js";
+import { NotFoundError, ValidationError, PROJECT_STATUSES } from "../shared/domain.js";
 import type { ProjectRepository } from "./project-repository.js";
 
 export interface CreateProjectInput { name: string; repoPath: string; baseBranch?: string; worktreeRoot: string; status?: ProjectStatus; maxConcurrentTasks?: number; defaultWorkflowPreset?: string | null; }
@@ -13,4 +13,9 @@ export class ProjectService {
     return this.projects.create({ id: randomUUID(), name: input.name.trim(), repoPath: input.repoPath, baseBranch: input.baseBranch?.trim() || "main", worktreeRoot: input.worktreeRoot, status: input.status ?? "ACTIVE", maxConcurrentTasks: input.maxConcurrentTasks ?? 1, defaultWorkflowPreset: input.defaultWorkflowPreset ?? null, createdAt: timestamp, updatedAt: timestamp });
   }
   list(): Project[] { return this.projects.list(); }
+  setStatus(projectId: string, status: string): Project {
+    if (!PROJECT_STATUSES.includes(status as ProjectStatus)) throw new ValidationError(`status must be one of ${PROJECT_STATUSES.join(", ")}`);
+    if (!this.projects.findById(projectId)) throw new NotFoundError(`Project ${projectId} not found`);
+    return this.projects.updateStatus(projectId, status as ProjectStatus, this.now());
+  }
 }

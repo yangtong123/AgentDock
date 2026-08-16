@@ -2,15 +2,16 @@
 
 AgentDock is a multi-project coding-agent orchestrator. It is designed to coordinate provider-neutral coding agents across durable tasks, isolated repositories, configurable workflows, and deterministic verification.
 
-## Status: V0.1 — Core Foundation
+## Status: V0.2 — Multi-project + Git Worktree
 
-V0.1 implements the durable domain and persistence foundation: Projects, Tasks with immutable requirement revisions, workflow/step run records, agent thread records, artifacts, SQLite migrations, repository/service boundaries, and a local operator CLI. It deliberately does **not** run coding agents or workflows.
+V0.2 adds Git worktree isolation on top of the V0.1 foundation: projects reference real Git repositories, tasks get isolated worktrees and branches (`agentdock/<task-id>` under the project's `worktreeRoot`), and the CLI can prepare/clean up worktrees and inspect task status/diff. It deliberately does **not** run coding agents or workflows.
 
 See [the roadmap](docs/ROADMAP.md) and [the V0.1 development contract](docs/tasks/V0.1-CODEX-TASK.md).
 
 ## Prerequisites and installation
 
 - Node.js **22.13 or newer** (the implementation uses the built-in `node:sqlite` API)
+- Git **2.28 or newer**
 - npm
 
 ```bash
@@ -46,7 +47,17 @@ npm run cli -- task show --task-id <task-id>
 
 # Preserve revision 1 and make revision 2 current
 npm run cli -- task revise --task-id <task-id> --request "Add readiness and liveness endpoints"
+
+# Isolated worktrees (repo-path must be a Git work tree with the base branch)
+npm run cli -- project validate --project-id <project-id>
+npm run cli -- task prepare --task-id <task-id>   # creates <worktree-root>/<task-id> + branch agentdock/<task-id>
+npm run cli -- task status --task-id <task-id>    # branch, HEAD/base SHA, changed files
+npm run cli -- task diff --task-id <task-id> --stat
+npm run cli -- task cleanup --task-id <task-id>   # removes worktree + branch; --force also discards dirty worktrees and unmerged commits
+npm run cli -- project set-status --project-id <project-id> --status PAUSED   # ACTIVE|PAUSED|DISABLED
 ```
+
+`task prepare` is idempotent and recovers from a deleted worktree directory as long as the branch survives (Git is the source of truth). Tasks in PAUSED/DISABLED projects cannot be prepared.
 
 Use the same `AGENTDOCK_DB` value on later invocations to reopen and inspect persisted data.
 
@@ -57,8 +68,8 @@ npm run typecheck
 npm test
 ```
 
-The core is split into domain-focused modules under `src/`. Services own operations such as atomically creating a Task and its initial TaskRevision; SQLite repositories encapsulate SQL. Workflow, agent-thread, and artifact modules in V0.1 are persistence abstractions only.
+The core is split into domain-focused modules under `src/`. Services own operations such as atomically creating a Task and its initial TaskRevision; SQLite repositories encapsulate SQL. `src/git/` contains the `GitService` (execFile-based, argument arrays only, shell disabled) and the `WorktreeManager` that owns the branch/worktree lifecycle. Workflow, agent-thread, and artifact modules remain persistence abstractions until later milestones.
 
 ## Intentionally deferred
 
-Coding-agent execution (Codex and Claude), process runners, Git worktrees, workflow execution, schedulers, Telegram, Feishu/Lark, GitHub integration, Redis, and a web dashboard belong to future roadmap milestones. In particular, Git worktree lifecycle begins in V0.2; V0.1 stores only the fields required for that future boundary.
+Coding-agent execution (Codex and Claude), process runners for agents, workflow execution, schedulers, Telegram, Feishu/Lark, GitHub integration, Redis, and a web dashboard belong to future roadmap milestones (agent runtime starts in V0.3).

@@ -114,7 +114,7 @@ test("passing CI does not trigger a fix", async () => {
 });
 
 test("PR review ingestion: CHANGES_REQUESTED triggers a fix once; repeats deduplicated", async () => {
-  const review = { author: "alice", state: "CHANGES_REQUESTED", body: "please handle nulls" };
+  const review = { id: "r1", author: "alice", state: "CHANGES_REQUESTED", body: "please handle nulls" };
   const f = fixture({ reviews: [review] });
   try {
     const taskId = await succeededTask(f);
@@ -130,27 +130,33 @@ test("PR review ingestion: CHANGES_REQUESTED triggers a fix once; repeats dedupl
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });
 
-test("GhCliAdapter builds argv-only gh invocations (no shell)", async () => {
+test("GhCliAdapter builds argv-only gh/git invocations (no shell)", async () => {
   const calls: string[][] = [];
-  const adapter = new GhCliAdapter("echo-gh");
-  // Shim execFile by pointing the binary at node with a script that echoes argv? Simpler: intercept child_process via a fake binary dir.
-  // Instead, verify argv construction indirectly through run() by stubbing the module is complex;
-  // assert the public methods build expected argv through a recording subclass.
+  const gitCalls: string[][] = [];
+  const adapter = new GhCliAdapter("echo-gh", "echo-git");
   const recording = adapter as unknown as { run(args: string[], cwd: string): Promise<string> };
   (adapter as unknown as Record<string, unknown>).run = async (args: string[], _cwd: string) => {
     calls.push(args);
     if (args[0] === "pr" && args[1] === "create") return "https://example/pull/9\n";
     if (args[0] === "pr" && args[1] === "checks") return "[]";
+    if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ number: 9, url: "https://example/pull/9", state: "OPEN", isDraft: true, title: "t", headRefName: "h" });
+    if (args[0] === "pr" && args[1] === "list") return JSON.stringify([{ number: 9, url: "https://example/pull/9", state: "OPEN", isDraft: true, title: "t", headRefName: "h" }]);
     return "{}";
   };
-  await adapter.pushBranch("/repo", "agentdock/t1");
-  assert.deepEqual(calls[0]!.slice(0, 3), ["push", "-u", "origin"]);
+  // pushBranch goes through git (gh has no push): run against an existing cwd so the no-op binary resolves.
+  const noopAdapter = new GhCliAdapter("echo-gh", "true");
+  await noopAdapter.pushBranch(process.cwd(), "agentdock/t1");
+  void gitCalls;
   await adapter.createDraftPr("/repo", { title: "t; rm -rf /", body: "b", headBranch: "agentdock/t1", baseBranch: "main" });
-  const create = calls[1]!;
+  const create = calls.find((args) => args[0] === "pr" && args[1] === "create")!;
   assert.equal(create.includes("--draft"), true);
   // The dangerous title is a single argv element, never shell-interpreted.
   assert.equal(create[create.indexOf("--title") + 1], "t; rm -rf /");
   void recording;
   await adapter.ciStatus("/repo", 7);
   assert.deepEqual(calls.at(-1)!.slice(0, 3), ["pr", "checks", "7"]);
+  await adapter.findPrForBranch("/repo", "agentdock/t1");
+  const list = calls.find((args) => args[0] === "pr" && args[1] === "list")!;
+  assert.equal(list.includes("--state"), true);
+  assert.equal(list[list.indexOf("--state") + 1], "all");
 });

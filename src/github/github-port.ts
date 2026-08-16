@@ -15,6 +15,8 @@ export interface CheckRun {
 }
 
 export interface PrReview {
+  /** Stable review id from GitHub; null when the backend provides none. */
+  id: string | null;
   author: string;
   state: string;
   body: string;

@@ -102,7 +102,8 @@ export class GitHubService {
     const all = await this.github.reviews(project.repoPath, record.prNumber);
     const fresh: PrReview[] = [];
     for (const review of all) {
-      const key = `${record.prNumber}:${review.author}:${review.state}:${review.body.length}`;
+      // Prefer the stable review id; the positional index is only a fallback when the backend has none.
+      const key = review.id !== null ? `${record.prNumber}:r:${review.id}` : `${record.prNumber}:${review.author}:${review.state}:${review.body.length}:${all.indexOf(review)}`;
       const seen = this.db.prepare("SELECT 1 FROM github_review_ingested WHERE review_key = ?").get(key);
       if (seen === undefined) {
         fresh.push(review);
@@ -123,6 +124,32 @@ export class GitHubService {
   /** Pending fix triggers for a task (CI failures, review feedback). */
   pendingFixTriggers(taskId: string): { reason: string; detail: string }[] {
     return this.db.prepare("SELECT reason, detail FROM github_fix_events WHERE task_id = ? ORDER BY created_at").all(taskId) as { reason: string; detail: string }[];
+  }
+
+  /**
+   * FIX workflow for CI failures / review feedback: builds fix instructions
+   * from the durable triggers. The caller (workflow engine / orchestrator)
+   * runs the agent; this service only translates triggers into a prompt.
+   */
+  fixInstructions(taskId: string): string | null {
+    const triggers = this.pendingFixTriggers(taskId);
+    if (triggers.length === 0) return null;
+    const lines: string[] = [];
+    for (const trigger of triggers) {
+      if (trigger.reason === "CI_FAILURE") {
+        const checks = JSON.parse(trigger.detail) as string[];
+        lines.push(`CI checks failed: ${checks.join(", ")}. Fix the failures and make CI pass.`);
+      } else if (trigger.reason === "PR_REVIEW") {
+        const reviews = JSON.parse(trigger.detail) as { author: string; body: string }[];
+        for (const review of reviews) lines.push(`Review feedback from ${review.author}: ${review.body}`);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  /** Clears consumed fix triggers (after a fix workflow accepted them). */
+  clearFixTriggers(taskId: string): void {
+    this.db.prepare("DELETE FROM github_fix_events WHERE task_id = ?").run(taskId);
   }
 
   private map(row: Record<string, unknown>): PrRecord {

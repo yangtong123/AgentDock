@@ -41,6 +41,9 @@ const DEFAULT_STEP_TIMEOUT_MS = 30 * 60 * 1000;
  * bound, then fails rather than looping forever.
  */
 export class WorkflowEngine {
+  /** External fix instructions (e.g. GitHub CI failures / PR review feedback). */
+  private readonly fixInstructions: (taskId: string) => string | null;
+
   constructor(
     private readonly workflows: WorkflowRepository,
     private readonly tasks: TaskRepository,
@@ -48,9 +51,17 @@ export class WorkflowEngine {
     private readonly runtime: AgentThreadManager,
     private readonly artifacts: ArtifactRepository,
     private readonly verifyRunner: ProcessRunner,
-    private readonly baseEnv: NodeJS.ProcessEnv = process.env,
-    private readonly now = () => new Date().toISOString(),
-  ) {}
+    baseEnv: NodeJS.ProcessEnv = process.env,
+    now: () => string = () => new Date().toISOString(),
+    fixInstructions: (taskId: string) => string | null = () => null,
+  ) {
+    this.baseEnv = baseEnv;
+    this.now = now;
+    this.fixInstructions = fixInstructions;
+  }
+
+  private readonly baseEnv: NodeJS.ProcessEnv;
+  private readonly now: () => string;
 
   async start(input: StartWorkflowInput): Promise<WorkflowStatus> {
     const task = this.tasks.findById(input.taskId);
@@ -264,7 +275,14 @@ export class WorkflowEngine {
       case "REVIEW":
       case "FINAL_REVIEW":
         return `${base}\n\nReview the current uncommitted diff. Report each issue on its own line as: FINDING [BLOCKER|MAJOR|MINOR|NIT] file:line summary\nEnd with exactly one line: VERDICT: PASS or VERDICT: NEEDS_FIXES. Do not modify files.`;
-      case "FIX": return `${base}${openFindings.length > 0 ? `\n\nOpen findings from the latest review:\n${renderFindings(openFindings)}` : ""}\n\nFix the reported issues in the current diff.`;
+      case "FIX": {
+        const externalFix = this.fixInstructions(task.id);
+        const sections = [
+          openFindings.length > 0 ? `Open findings from the latest review:\n${renderFindings(openFindings)}` : null,
+          externalFix !== null ? `External fix requirements (CI/review):\n${externalFix}` : null,
+        ].filter((section): section is string => section !== null);
+        return `${base}${sections.length > 0 ? `\n\n${sections.join("\n\n")}` : ""}\n\nFix the reported issues in the current diff.`;
+      }
       default: return base;
     }
   }

@@ -1,0 +1,16 @@
+import { randomUUID } from "node:crypto";
+import type { Project, ProjectStatus } from "../shared/domain.js";
+import { ValidationError } from "../shared/domain.js";
+import type { ProjectRepository } from "./project-repository.js";
+
+export interface CreateProjectInput { name: string; repoPath: string; baseBranch?: string; worktreeRoot: string; status?: ProjectStatus; maxConcurrentTasks?: number; defaultWorkflowPreset?: string | null; }
+export class ProjectService {
+  constructor(private readonly projects: ProjectRepository, private readonly now = () => new Date().toISOString()) {}
+  create(input: CreateProjectInput): Project {
+    if (!input.name.trim() || !input.repoPath.trim() || !input.worktreeRoot.trim()) throw new ValidationError("name, repoPath, and worktreeRoot are required");
+    if ((input.maxConcurrentTasks ?? 1) < 1) throw new ValidationError("maxConcurrentTasks must be positive");
+    const timestamp = this.now();
+    return this.projects.create({ id: randomUUID(), name: input.name.trim(), repoPath: input.repoPath, baseBranch: input.baseBranch?.trim() || "main", worktreeRoot: input.worktreeRoot, status: input.status ?? "ACTIVE", maxConcurrentTasks: input.maxConcurrentTasks ?? 1, defaultWorkflowPreset: input.defaultWorkflowPreset ?? null, createdAt: timestamp, updatedAt: timestamp });
+  }
+  list(): Project[] { return this.projects.list(); }
+}

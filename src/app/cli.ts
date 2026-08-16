@@ -6,12 +6,13 @@ import { expandPreset } from "../workflows/presets.js";
 import type { StepType } from "../shared/domain.js";
 import { ImController } from "../im/im-controller.js";
 import { TelegramAdapter } from "../im/telegram-adapter.js";
+import { FeishuAdapter } from "../im/feishu-adapter.js";
 import { GitHubService } from "../github/github-service.js";
 import { GhCliAdapter } from "../github/gh-cli-adapter.js";
 
 function option(args:string[],name:string,required=true):string|undefined { const i=args.indexOf(`--${name}`); const value=i>=0?args[i+1]:undefined; if(required&&!value) throw new Error(`Missing --${name}`); return value; }
 function has(args:string[],name:string):boolean { return args.includes(`--${name}`); }
-function usage():never { console.error(`AgentDock V0.5
+function usage():never { console.error(`AgentDock V1.0
 Usage:
   agentdock serve (long-running: Telegram adapter when TELEGRAM_BOT_TOKEN is set)
   agentdock migrate
@@ -60,10 +61,13 @@ try {
   const app=createApplication(db); const [resource,action]=args;
   if(resource==="serve") {
     const telegramToken=process.env.TELEGRAM_BOT_TOKEN;
+    const feishuPort=Number(process.env.FEISHU_WEBHOOK_PORT??0);
     const controller=new ImController(db,app);
     if(telegramToken) controller.register(new TelegramAdapter(telegramToken));
+    if(feishuPort>0) controller.register(new FeishuAdapter(feishuPort,undefined,process.env.FEISHU_VERIFICATION_TOKEN??null,()=>process.env.FEISHU_TENANT_TOKEN??null));
     await controller.startAll();
-    console.log(`AgentDock serving (${telegramToken?"telegram":"no IM adapters configured"}). Ctrl-C to stop.`);
+    const adapters=[telegramToken?"telegram":null,feishuPort>0?"feishu":null].filter(Boolean).join("+")||"no IM adapters configured";
+    console.log(`AgentDock serving (${adapters}). Ctrl-C to stop.`);
     await new Promise(()=>{});
   }
   else if(resource==="migrate") console.log("Migrations applied.");

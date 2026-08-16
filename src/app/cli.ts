@@ -2,13 +2,15 @@
 import { resolve } from "node:path";
 import { openDatabase } from "../db/database.js";
 import { createApplication } from "./application.js";
+import { expandPreset } from "../workflows/presets.js";
+import type { StepType } from "../shared/domain.js";
 
 function option(args:string[],name:string,required=true):string|undefined { const i=args.indexOf(`--${name}`); const value=i>=0?args[i+1]:undefined; if(required&&!value) throw new Error(`Missing --${name}`); return value; }
 function has(args:string[],name:string):boolean { return args.includes(`--${name}`); }
-function usage():never { console.error(`AgentDock V0.2
+function usage():never { console.error(`AgentDock V0.4
 Usage:
   agentdock migrate
-  agentdock project add --name NAME --repo-path PATH --worktree-root PATH [--base-branch main] [--max-concurrent-tasks 1]
+  agentdock project add --name NAME --repo-path PATH --worktree-root PATH [--base-branch main] [--max-concurrent-tasks 1] [--verify-command JSON_ARGV]
   agentdock project list
   agentdock project validate --project-id ID
   agentdock project set-status --project-id ID --status ACTIVE|PAUSED|DISABLED
@@ -20,8 +22,26 @@ Usage:
   agentdock task cleanup --task-id ID [--force]
   agentdock task status --task-id ID
   agentdock task diff --task-id ID [--stat]
+  agentdock workflow start --task-id ID --preset fast|cross-review|careful [--provider STEP=NAME ...]
+  agentdock workflow execute --run-id ID
+  agentdock workflow status --run-id ID
+  agentdock workflow approve --run-id ID [--reject]
+  agentdock workflow cancel --run-id ID
 
 Set AGENTDOCK_DB to choose the database (default: .agentdock/agentdock.db).`); process.exit(1); }
+
+function parseProviderOverrides(args:string[]): Partial<Record<StepType,string>> {
+  const overrides: Partial<Record<StepType,string>> = {};
+  for (let index=0;index<args.length;index++) {
+    if(!args[index]!.startsWith("--provider")) continue;
+    const value=args[index+1]; if(!value) throw new Error("--provider requires STEP=NAME");
+    const [step,provider]=value.split("=");
+    if(!step||!provider) throw new Error("--provider requires STEP=NAME");
+    expandPreset("careful").some((entry)=>entry.stepType===step) || (()=>{throw new Error(`Unknown step type: ${step}`);})();
+    overrides[step as StepType]=provider;
+  }
+  return overrides;
+}
 
 const args=process.argv.slice(2); if(args.includes("--help")||args.length===0) usage();
 const db=openDatabase(resolve(process.env.AGENTDOCK_DB??".agentdock/agentdock.db"));
@@ -30,7 +50,9 @@ try {
   if(resource==="migrate") console.log("Migrations applied.");
   else if(resource==="project"&&action==="add") {
     const baseBranch=option(args,"base-branch",false);
-    console.log(JSON.stringify(app.projects.create({name:option(args,"name")!,repoPath:option(args,"repo-path")!,worktreeRoot:option(args,"worktree-root")!,...(baseBranch === undefined ? {} : {baseBranch}),maxConcurrentTasks:Number(option(args,"max-concurrent-tasks",false)??1)}),null,2));
+    const verifyCommandRaw=option(args,"verify-command",false);
+    const verifyCommand=verifyCommandRaw===undefined?undefined:JSON.parse(verifyCommandRaw) as string[];
+    console.log(JSON.stringify(app.projects.create({name:option(args,"name")!,repoPath:option(args,"repo-path")!,worktreeRoot:option(args,"worktree-root")!,...(baseBranch === undefined ? {} : {baseBranch}),maxConcurrentTasks:Number(option(args,"max-concurrent-tasks",false)??1),...(verifyCommand===undefined?{}:{verifyCommand})}),null,2));
   }
   else if(resource==="project"&&action==="list") console.log(JSON.stringify(app.projects.list(),null,2));
   else if(resource==="project"&&action==="set-status") console.log(JSON.stringify(app.projects.setStatus(option(args,"project-id")!,option(args,"status")!),null,2));
@@ -43,5 +65,10 @@ try {
   else if(resource==="task"&&action==="cleanup") console.log(JSON.stringify(await app.worktrees.cleanup(option(args,"task-id")!,{force:has(args,"force")}),null,2));
   else if(resource==="task"&&action==="status") console.log(JSON.stringify(await app.worktrees.status(option(args,"task-id")!),null,2));
   else if(resource==="task"&&action==="diff") console.log(await app.worktrees.diff(option(args,"task-id")!,{stat:has(args,"stat")}));
+  else if(resource==="workflow"&&action==="start") console.log(JSON.stringify(await app.workflows.start({taskId:option(args,"task-id")!,preset:option(args,"preset")!,providers:parseProviderOverrides(args)}),null,2));
+  else if(resource==="workflow"&&action==="execute") console.log(JSON.stringify(await app.workflows.execute(option(args,"run-id")!),null,2));
+  else if(resource==="workflow"&&action==="status") console.log(JSON.stringify(app.workflows.status(option(args,"run-id")!),null,2));
+  else if(resource==="workflow"&&action==="approve") console.log(JSON.stringify(app.workflows.approve(option(args,"run-id")!,!has(args,"reject")),null,2));
+  else if(resource==="workflow"&&action==="cancel") console.log(JSON.stringify(app.workflows.cancel(option(args,"run-id")!),null,2));
   else usage();
 } catch(error) { console.error(error instanceof Error?error.message:error); process.exitCode=1; } finally { db.close(); }

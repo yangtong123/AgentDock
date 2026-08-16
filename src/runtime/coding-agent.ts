@@ -3,6 +3,8 @@ import type { ProcessRunner } from "./process-runner.js";
 /** Context handed to a coding agent for one step execution. */
 export interface AgentRunContext {
   taskId: string;
+  /** Workflow step type this run serves (PLAN, IMPLEMENT, REVIEW, ...). */
+  role: string;
   worktreePath: string;
   prompt: string;
   /** External session id from a previous step of the same thread, if resuming. */

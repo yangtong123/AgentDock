@@ -73,6 +73,7 @@ export class AgentThreadManager {
     try {
       outcome = await agent.run({
         taskId: input.taskId,
+        role: input.role,
         worktreePath: task.worktreePath,
         prompt: input.prompt,
         resumeSessionId: thread.externalSessionId,
@@ -84,7 +85,7 @@ export class AgentThreadManager {
       if (thread.externalSessionId && outcome.externalSessionId === null && (outcome.exitCode ?? 1) !== 0) {
         this.captureArtifacts(thread, outcome, "resume-failed");
         outcome = await agent.run({
-          taskId: input.taskId, worktreePath: task.worktreePath,
+          taskId: input.taskId, role: input.role, worktreePath: task.worktreePath,
           prompt: `${input.revisionRequest}\n\n${input.prompt}`,
           resumeSessionId: null, revisionRequest: input.revisionRequest,
           timeoutMs: input.timeoutMs, env,

@@ -233,23 +233,23 @@ function spyRunner(overrides: { stdout?: string } = {}): { runner: ProcessRunner
 test("ClaudeAgent and CodexAgent build correct argv with and without resume", async () => {
   const { runner, argv } = spyRunner();
   const claude = new ClaudeAgent(runner);
-  await claude.run({ taskId: "t", worktreePath: "/wt", prompt: "do", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
+  await claude.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "do", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.deepEqual(argv().slice(0, 4), ["claude", "-p", "--output-format", "json"]);
   assert.equal(argv().includes("do"), true);
-  await claude.run({ taskId: "t", worktreePath: "/wt", prompt: "more", resumeSessionId: "s1", revisionRequest: "r", timeoutMs: 1000, env: {} });
+  await claude.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "more", resumeSessionId: "s1", revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.deepEqual(argv().slice(4, 6), ["--resume", "s1"]);
   const codex = new CodexAgent(runner);
-  await codex.run({ taskId: "t", worktreePath: "/wt", prompt: "do", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
+  await codex.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "do", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.deepEqual(argv().slice(0, 3), ["codex", "exec", "--skip-git-repo-check"]);
-  await codex.run({ taskId: "t", worktreePath: "/wt", prompt: "do", resumeSessionId: "s2", revisionRequest: "r", timeoutMs: 1000, env: {} });
+  await codex.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "do", resumeSessionId: "s2", revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.deepEqual(argv().slice(4, 6), ["resume", "s2"]);
 });
 
 test("CodexAgent parses session ids from both plain and JSON output", async () => {
   const plain = spyRunner({ stdout: `session id: 12345678-1234-1234-1234-123456789012\nwork work\n` });
-  const plainOutcome = await new CodexAgent(plain.runner).run({ taskId: "t", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
+  const plainOutcome = await new CodexAgent(plain.runner).run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.equal(plainOutcome.externalSessionId, "12345678-1234-1234-1234-123456789012");
   const json = spyRunner({ stdout: `{"session_id":"abcdefab-cdef-abcd-efab-cdefabcdefab","type":"message"}\n` });
-  const jsonOutcome = await new CodexAgent(json.runner).run({ taskId: "t", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
+  const jsonOutcome = await new CodexAgent(json.runner).run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.equal(jsonOutcome.externalSessionId, "abcdefab-cdef-abcd-efab-cdefabcdefab");
 });

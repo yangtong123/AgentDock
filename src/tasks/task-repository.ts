@@ -15,6 +15,7 @@ export interface TaskRepository {
   update(taskId: string, changes: TaskChanges, updatedAt: string): Task;
   findById(id: string): Task | undefined;
   findRevision(taskId: string, revision: number): TaskRevision | undefined;
+  findRevisionById(revisionId: string): TaskRevision | undefined;
   listRevisions(taskId: string): TaskRevision[];
   list(projectId?: string): Task[];
 }
@@ -49,6 +50,7 @@ export class SqliteTaskRepository implements TaskRepository {
   }
   findById(id:string):Task|undefined { const r=this.db.prepare("SELECT * FROM tasks WHERE id=?").get(id) as TaskRow|undefined; return r&&mapTask(r); }
   findRevision(taskId:string,revision:number):TaskRevision|undefined { const r=this.db.prepare("SELECT * FROM task_revisions WHERE task_id=? AND revision=?").get(taskId,revision) as RevisionRow|undefined; return r&&mapRevision(r); }
+  findRevisionById(revisionId:string):TaskRevision|undefined { const r=this.db.prepare("SELECT * FROM task_revisions WHERE id=?").get(revisionId) as RevisionRow|undefined; return r&&mapRevision(r); }
   listRevisions(taskId:string):TaskRevision[] { return (this.db.prepare("SELECT * FROM task_revisions WHERE task_id=? ORDER BY revision").all(taskId) as RevisionRow[]).map(mapRevision); }
   list(projectId?:string):Task[] { const rows = projectId === undefined ? this.db.prepare("SELECT * FROM tasks ORDER BY created_at,id").all() : this.db.prepare("SELECT * FROM tasks WHERE project_id=? ORDER BY created_at,id").all(projectId); return (rows as TaskRow[]).map(mapTask); }
 }

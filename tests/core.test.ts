@@ -11,7 +11,7 @@ function project(app:ReturnType<typeof createApplication>,name="alpha") { return
 
 test("migrates a clean database safely and enables foreign keys",()=>{
   const fixture=temporaryDatabase(); const db=openDatabase(fixture.path); try {
-    assert.equal(db.prepare("SELECT COUNT(*) count FROM schema_migrations").get()!.count,1);
+    assert.equal((db.prepare("SELECT COUNT(*) count FROM schema_migrations").get() as {count:number}).count,2);
     assert.equal(db.prepare("PRAGMA foreign_keys").get()!.foreign_keys,1);
     assert.doesNotThrow(()=>openDatabase(fixture.path).close());
   } finally { db.close(); rmSync(fixture.directory,{recursive:true,force:true}); }

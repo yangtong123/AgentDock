@@ -13,6 +13,8 @@ export type StepType = (typeof STEP_TYPES)[number];
 export interface Project {
   id: string; name: string; repoPath: string; baseBranch: string; worktreeRoot: string;
   status: ProjectStatus; maxConcurrentTasks: number; defaultWorkflowPreset: string | null;
+  /** Deterministic verification command, stored as a JSON argv array. */
+  verifyCommand: string[] | null;
   createdAt: string; updatedAt: string;
 }
 export interface Task {

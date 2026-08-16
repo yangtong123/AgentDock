@@ -32,6 +32,8 @@ export function createApplication(db:Database, options:{ agents?: Record<string,
     worktrees,
     runtime,
     workflows:new WorkflowEngine(workflowRepository,taskRepository,projectRepository,runtime,artifactRepository,runner),
+    /** Shared runner so cancellation reaches the same processes the app spawned. */
+    processRunner:runner,
     repositories:{projects:projectRepository,tasks:taskRepository,workflows:workflowRepository,agentThreads:agentThreadRepository,artifacts:artifactRepository},
   };
 }

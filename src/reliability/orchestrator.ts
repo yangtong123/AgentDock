@@ -45,11 +45,18 @@ export class Orchestrator {
     this.queue = new TaskQueue(db, clock);
   }
 
-  /** Idempotent command execution wrapper. */
-  once(commandKey: string, action: () => Promise<void> | void): Promise<boolean> {
+  /** Idempotent command execution wrapper. The dedup key is only consumed on success. */
+  async once(commandKey: string, action: () => Promise<void> | void): Promise<boolean> {
     const dedup = new CommandDedup(this.db, () => this.clock.now().toISOString());
-    if (!dedup.claim(commandKey)) return Promise.resolve(false);
-    return Promise.resolve(action()).then(() => true);
+    if (!dedup.claim(commandKey)) return false;
+    try {
+      await action();
+      return true;
+    } catch (error) {
+      // Failed commands stay retryable: release the key before propagating.
+      this.db.prepare("DELETE FROM command_dedup WHERE command_key = ?").run(commandKey);
+      throw error;
+    }
   }
 
   /** Recovery pass: RUNNING tasks with an in-flight run but no live lease are failed. */
@@ -97,19 +104,26 @@ export class Orchestrator {
     this.loop = null;
   }
 
-  /** Cancels a task: marks CANCEL_REQUESTED, releases the lease, kills processes. */
+  /** Cancels a task: marks CANCEL_REQUESTED, kills that task's process tree only. */
   requestCancel(taskId: string): void {
     const task = this.app.repositories.tasks.findById(taskId);
     if (!task) return;
     if (task.state === "RUNNING") this.app.repositories.tasks.update(taskId, { state: "CANCEL_REQUESTED" }, this.clock.now().toISOString());
-    this.processRunner.cancelAll();
+    // Owner-scoped: other tasks' agents keep running.
+    this.processRunner.cancelOwner(taskId);
     this.outbox.publish({ taskId, type: "task.cancel-requested", payload: { taskId } });
   }
 
   private async runLoop(): Promise<void> {
     const pollMs = this.options.pollMs ?? DEFAULTS.pollMs;
     const heartbeatMs = this.options.heartbeatMs ?? DEFAULTS.heartbeatMs;
+    let lastReap = 0;
     while (!this.stopped) {
+      // Periodic reaping: recover tasks orphaned by crashed workers while we run.
+      if (this.clock.now().getTime() - lastReap >= 5 * pollMs) {
+        lastReap = this.clock.now().getTime();
+        this.recoverOrphans();
+      }
       const entry = this.queue.nextDue(
         this.runningCountByProject(),
         this.runningTotal(),
@@ -124,8 +138,7 @@ export class Orchestrator {
       // Claim under a lease; a competing orchestrator loses the race.
       const leaseKey = `task:${entry.taskId}`;
       if (!this.leases.acquire(leaseKey, this.workerId, entry.taskId, this.options.leaseTtlMs ?? DEFAULTS.leaseTtlMs)) { await sleep(pollMs); continue; }
-      this.queue.dequeue(entry.taskId);
-      void this.runTask(entry.taskId, leaseKey, heartbeatMs);
+      void this.runTask(entry.taskId, leaseKey, heartbeatMs).finally(() => { this.queue.dequeue(entry.taskId); });
       await sleep(pollMs);
     }
   }
@@ -134,16 +147,20 @@ export class Orchestrator {
     const heartbeat = setInterval(() => {
       if (!this.leases.heartbeat(leaseKey, this.workerId, this.options.leaseTtlMs ?? DEFAULTS.leaseTtlMs)) this.requestCancel(taskId);
     }, heartbeatMs);
+    // Hard task timeout: cancel the task's processes; the execute() promise rejects with the cancellation.
+    const timeout = setTimeout(() => {
+      this.outbox.publish({ taskId, type: "task.timeout", payload: { taskId } });
+      this.requestCancel(taskId);
+    }, this.options.taskTimeoutMs ?? DEFAULTS.taskTimeoutMs);
     try {
       const activeRun = this.activeRunId(taskId);
       if (activeRun === null) throw new Error(`Task ${taskId} has no run to execute`);
-      const timedOut = this.clock.now().getTime() + (this.options.taskTimeoutMs ?? DEFAULTS.taskTimeoutMs);
       const status = await this.app.workflows.execute(activeRun);
-      void timedOut;
       this.outbox.publish({ taskId, workflowRunId: activeRun, type: `run.${status.run.state.toLowerCase()}`, payload: { taskId, runId: activeRun, state: status.run.state } });
     } catch (error) {
       this.outbox.publish({ taskId, type: "run.worker-error", payload: { taskId, message: error instanceof Error ? error.message : String(error) } });
     } finally {
+      clearTimeout(timeout);
       clearInterval(heartbeat);
       this.leases.release(leaseKey, this.workerId);
     }

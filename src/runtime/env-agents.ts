@@ -37,6 +37,7 @@ export class EnvCodingAgent implements CodingAgent {
       argv: this.options.argv(context),
       env: context.env,
       timeoutMs: context.timeoutMs,
+      owner: context.taskId,
     });
     return {
       exitCode: result.exitCode,

@@ -46,10 +46,23 @@ export class TransactionalOutbox {
       .run(event.taskId ?? null, event.workflowRunId ?? null, event.type, JSON.stringify(event.payload ?? {}), this.now());
   }
 
-  /** Marks the next unprocessed batch as owned by `worker` and returns it. */
-  claimBatch(_worker: string, limit: number): OutboxEvent[] {
-    const rows = this.db.prepare("SELECT * FROM outbox_events WHERE processed_at IS NULL ORDER BY id LIMIT ?").all(limit) as (Record<string, unknown>)[];
-    return rows.map((row) => this.toEvent(row));
+  /**
+   * Atomically claims up to `limit` unprocessed events for `worker` and
+   * returns them. Claimed rows are still processed-at NULL (so a crash
+   * re-delivers them); the processed_by marker records the current claimer.
+   */
+  claimBatch(worker: string, limit: number): OutboxEvent[] {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const rows = this.db.prepare("SELECT * FROM outbox_events WHERE processed_at IS NULL ORDER BY id LIMIT ?").all(limit) as (Record<string, unknown>)[];
+      const claim = this.db.prepare("UPDATE outbox_events SET processed_by = ? WHERE id = ?");
+      for (const row of rows) claim.run(worker, Number(row.id));
+      this.db.exec("COMMIT");
+      return rows.map((row) => this.toEvent(row));
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   /** Marks an event delivered. Called only after its side effect succeeded. */

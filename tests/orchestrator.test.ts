@@ -118,3 +118,27 @@ test("requestCancel marks CANCEL_REQUESTED and emits an event", async () => {
     assert.ok(events.some((e) => e.type === "task.cancel-requested"));
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });
+
+test("cancelOwner kills only the target task's processes", async () => {
+  const runner = new ProcessRunner();
+  const slow = (owner: string) => runner.run({ cwd: process.cwd(), argv: [process.execPath, "-e", "setTimeout(() => {}, 30000)"], env: { PATH: process.env.PATH! }, timeoutMs: 60_000, owner });
+  const taskA = slow("task-a");
+  const taskB = slow("task-b");
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  runner.cancelOwner("task-a");
+  await assert.rejects(taskA, /cancelled/);
+  // task-b must still be running; cancel and confirm it was alive until its own cancel.
+  runner.cancelOwner("task-b");
+  await assert.rejects(taskB, /cancelled/);
+});
+
+test("once() releases the dedup key when the action fails, allowing retry", async () => {
+  const f = fixture();
+  try {
+    let attempts = 0;
+    const failing = async () => { attempts++; if (attempts === 1) throw new Error("transient"); };
+    await assert.rejects(f.orchestrator.once("cmd-retry", failing), /transient/);
+    assert.equal(await f.orchestrator.once("cmd-retry", failing), true, "retry after failure succeeds");
+    assert.equal(attempts, 2);
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});

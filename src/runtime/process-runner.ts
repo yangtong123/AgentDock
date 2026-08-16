@@ -6,6 +6,8 @@ export interface ProcessOptions {
   argv: string[];
   env: Record<string, string>;
   timeoutMs: number;
+  /** Owner grouping so cancellation can target one task's processes, not all. */
+  owner?: string;
   stdin?: string;
   onStdout?: (chunk: string) => void;
   onStderr?: (chunk: string) => void;
@@ -35,7 +37,7 @@ interface RunningProcess {
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 
 export class ProcessRunner {
-  private readonly running = new Map<string, RunningProcess>();
+  private readonly running = new Map<string, { owner: string | undefined; entry: { cancel(reason: "timeout" | "cancel"): void } }>();
 
   /**
    * Spawns a process with shell semantics disabled. argv is always an argument
@@ -79,12 +81,12 @@ export class ProcessRunner {
       try { process.kill(-child.pid, "SIGTERM"); } catch { child.kill("SIGTERM"); }
     };
 
-    this.running.set(handle, {
+    this.running.set(handle, { owner: options.owner, entry: {
       cancel: (reason) => {
         if (reason === "timeout") timedOut = true; else cancelled = true;
         killTree();
       },
-    });
+    } });
 
     child.stdout?.on("data", (chunk: Buffer) => { const text = chunk.toString(); stdout = append(stdout, text); options.onStdout?.(text); });
     child.stderr?.on("data", (chunk: Buffer) => { const text = chunk.toString(); stderr = append(stderr, text); options.onStderr?.(text); });
@@ -94,7 +96,7 @@ export class ProcessRunner {
     if (options.stdin !== undefined) child.stdin?.end(options.stdin);
     else child.stdin?.end();
 
-    const timer = options.timeoutMs > 0 ? setTimeout(() => this.running.get(handle)?.cancel("timeout"), options.timeoutMs) : null;
+    const timer = options.timeoutMs > 0 ? setTimeout(() => this.running.get(handle)?.entry.cancel("timeout"), options.timeoutMs) : null;
     // SIGTERM escalation: a child that ignores SIGTERM must not outlive the run forever.
     const killTimer = options.timeoutMs > 0 ? setTimeout(() => { if (this.running.has(handle)) { if (process.platform === "win32") { if (child.pid !== undefined) spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]); } else if (child.pid !== undefined) { try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } } } }, options.timeoutMs + 5_000) : null;
 
@@ -106,7 +108,12 @@ export class ProcessRunner {
     return result;
   }
 
+  /** Cancels only the processes belonging to one owner (task); other tasks keep running. */
+  cancelOwner(owner: string): void {
+    for (const record of this.running.values()) if (record.owner === owner) record.entry.cancel("cancel");
+  }
+
   cancelAll(): void {
-    for (const entry of this.running.values()) entry.cancel("cancel");
+    for (const record of this.running.values()) record.entry.cancel("cancel");
   }
 }

@@ -9,6 +9,7 @@ import { TelegramAdapter } from "../im/telegram-adapter.js";
 import { FeishuAdapter } from "../im/feishu-adapter.js";
 import { GitHubService } from "../github/github-service.js";
 import { GhCliAdapter } from "../github/gh-cli-adapter.js";
+import { Orchestrator } from "../reliability/orchestrator.js";
 
 function option(args:string[],name:string,required=true):string|undefined { const i=args.indexOf(`--${name}`); const value=i>=0?args[i+1]:undefined; if(required&&!value) throw new Error(`Missing --${name}`); return value; }
 function has(args:string[],name:string):boolean { return args.includes(`--${name}`); }
@@ -65,9 +66,16 @@ try {
     const controller=new ImController(db,app);
     if(telegramToken) controller.register(new TelegramAdapter(telegramToken));
     if(feishuPort>0) controller.register(new FeishuAdapter(feishuPort,undefined,process.env.FEISHU_VERIFICATION_TOKEN??null,()=>process.env.FEISHU_TENANT_TOKEN??null));
+    // The orchestrator owns execution: leases, concurrency, timeouts, recovery.
+    const orchestrator=new Orchestrator(db,app,app.processRunner,{});
+    controller.attachOrchestrator(orchestrator);
     await controller.startAll();
+    await orchestrator.start();
     const adapters=[telegramToken?"telegram":null,feishuPort>0?"feishu":null].filter(Boolean).join("+")||"no IM adapters configured";
     console.log(`AgentDock serving (${adapters}). Ctrl-C to stop.`);
+    const shutdown=async()=>{ await orchestrator.stop(); await controller.stopAll(); db.close(); process.exit(0); };
+    process.on("SIGINT",()=>{ void shutdown(); });
+    process.on("SIGTERM",()=>{ void shutdown(); });
     await new Promise(()=>{});
   }
   else if(resource==="migrate") console.log("Migrations applied.");

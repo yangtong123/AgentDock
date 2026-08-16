@@ -3,17 +3,21 @@ import type { Application } from "../app/application.js";
 import type { ImAdapter, ImCommand, ImReply } from "./im-adapter.js";
 import { parseCommand } from "./command-parser.js";
 import { AuditLog } from "../security/permissions.js";
+import type { Orchestrator } from "../reliability/orchestrator.js";
 
 /**
  * Domain-level controller shared by every IM adapter (Telegram now, Feishu
  * later). IM input becomes ImCommands; this is the only place those touch
  * domain services. Replies route back through the originating adapter only —
  * cross-IM visibility comes from the shared durable task state, not from
- * broadcasting chat ids across platforms. Every command lands in the audit log.
+ * broadcasting chat ids across platforms. Every command lands in the audit
+ * log. When an Orchestrator is attached, task execution goes through its
+ * queue (leases, concurrency, cancellation) instead of running inline.
  */
 export class ImController {
   private readonly adapters = new Map<string, ImAdapter>();
   private readonly audit: AuditLog;
+  private orchestrator: Orchestrator | null = null;
 
   constructor(
     private readonly db: Database,
@@ -22,6 +26,9 @@ export class ImController {
   ) {
     this.audit = new AuditLog(db, now);
   }
+
+  /** Attach the orchestrator so runs execute under leases/concurrency, not inline. */
+  attachOrchestrator(orchestrator: Orchestrator): void { this.orchestrator = orchestrator; }
 
   register(adapter: ImAdapter): void {
     adapter.onMessage(async (message) => {
@@ -88,6 +95,11 @@ export class ImController {
           try {
             await this.app.worktrees.prepare(command.taskId);
             const started = await this.app.workflows.start({ taskId: command.taskId, preset: command.preset });
+            if (this.orchestrator !== null) {
+              // Production path: the orchestrator executes under lease/concurrency and notifies via outbox.
+              this.orchestrator.queue.enqueue(command.taskId);
+              return respond(`Run ${started.run.id} queued.`);
+            }
             const status = await this.app.workflows.execute(started.run.id);
             return respond(status.awaitingApproval
               ? `Run ${started.run.id} paused for your approval.`
@@ -118,6 +130,10 @@ export class ImController {
           if (!task) return respond(`Unknown task: ${command.taskId}`);
           const run = this.activeRunFor(command.taskId);
           if (run) {
+            if (this.orchestrator !== null) {
+              // Real cancellation: kill the task's process tree, then mark cancelled.
+              this.orchestrator.requestCancel(command.taskId);
+            }
             this.app.workflows.cancel(run.run.id);
             return respond(`Task ${command.taskId} stopped (run ${run.run.id} cancelled).`);
           }

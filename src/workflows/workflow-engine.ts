@@ -43,6 +43,10 @@ const DEFAULT_STEP_TIMEOUT_MS = 30 * 60 * 1000;
 export class WorkflowEngine {
   /** External fix instructions (e.g. GitHub CI failures / PR review feedback). */
   private readonly fixInstructions: (taskId: string) => string | null;
+  /** Optional metrics recorder; null keeps the engine dependency-free in tests. */
+  private readonly metrics: { recordStepDuration(stepRunId: string, durationMs: number): void } | null;
+  private readonly usage: ((entry: { taskId: string; provider: string; role: string; durationMs: number }) => void) | null;
+  private readonly budgetGuard: (taskId: string) => { ok: boolean; reason?: string } | null;
 
   constructor(
     private readonly workflows: WorkflowRepository,
@@ -54,10 +58,14 @@ export class WorkflowEngine {
     baseEnv: NodeJS.ProcessEnv = process.env,
     now: () => string = () => new Date().toISOString(),
     fixInstructions: (taskId: string) => string | null = () => null,
+    observability: { metrics?: { recordStepDuration(stepRunId: string, durationMs: number): void }; usage?: (entry: { taskId: string; provider: string; role: string; durationMs: number }) => void; budgetGuard?: (taskId: string) => { ok: boolean; reason?: string } | null } = {},
   ) {
     this.baseEnv = baseEnv;
     this.now = now;
     this.fixInstructions = fixInstructions;
+    this.metrics = observability.metrics ?? null;
+    this.usage = observability.usage ?? null;
+    this.budgetGuard = observability.budgetGuard ?? (() => null);
   }
 
   private readonly baseEnv: NodeJS.ProcessEnv;
@@ -219,6 +227,12 @@ export class WorkflowEngine {
   }
 
   private async executeStep(runId: string, step: StepRun, task: Task, revision: TaskRevision, openFindings: ReviewFinding[], threads: Map<string, string>, stepTimeoutMs: number): Promise<{ state: "SUCCEEDED" | "FAILED" | "PAUSED"; paused?: boolean; review?: { findings: ReviewFinding[]; verdict: "PASS" | "NEEDS_FIXES" } }> {
+    // Budget enforcement: a task past its caps fails fast instead of burning more agent time.
+    const budget = this.budgetGuard(task.id);
+    if (budget !== null && !budget.ok) {
+      this.workflows.updateStep(step.id, { state: "FAILED", updatedAt: this.now() });
+      return { state: "FAILED" };
+    }
     this.workflows.updateStep(step.id, { state: "RUNNING", updatedAt: this.now() });
     if (step.stepType === "HUMAN_APPROVAL") {
       // External gate: park the step back at QUEUED and surface PAUSED to the caller.
@@ -228,19 +242,24 @@ export class WorkflowEngine {
     if (step.stepType === "VERIFY") {
       const project = this.projects.findById(task.projectId);
       const command = project?.verifyCommand ?? null;
+      const startedAt = this.now();
       const ok = command === null ? true : await this.verify(command, task, stepTimeoutMs);
+      this.recordStepMetrics(step.id, startedAt);
       this.stepStateUnlessCancelled(runId, step.id, ok ? "SUCCEEDED" : "FAILED");
       return { state: ok ? "SUCCEEDED" : "FAILED" };
     }
     const policy: SessionPolicy = DEFAULT_SESSION_POLICIES[step.stepType] ?? "FRESH";
     const resumeThreadId = policy === "RESUME" ? threads.get(step.stepType) : undefined;
     const prompt = this.promptFor(step.stepType, revision, task, openFindings);
+    const startedAt = this.now();
     const execution = await this.runtime.run(
       { taskId: task.id, role: step.stepType, prompt, revisionRequest: revision.request, timeoutMs: stepTimeoutMs },
       step.provider ?? "claude",
       resumeThreadId === undefined ? {} : { resumeThreadId },
     );
     if (policy === "RESUME") threads.set(step.stepType, execution.thread.id);
+    this.recordStepMetrics(step.id, startedAt);
+    if (this.usage !== null) this.usage({ taskId: task.id, provider: step.provider ?? "unknown", role: step.stepType, durationMs: Date.parse(this.now()) - Date.parse(startedAt) });
     const ok = execution.failure === null;
     this.stepStateUnlessCancelled(runId, step.id, ok ? "SUCCEEDED" : "FAILED");
     const review = step.stepType === "REVIEW" || step.stepType === "FINAL_REVIEW"
@@ -248,6 +267,11 @@ export class WorkflowEngine {
       : undefined;
     if (review === undefined) return { state: ok ? "SUCCEEDED" : "FAILED" };
     return { state: ok ? "SUCCEEDED" : "FAILED", review: { findings: review.findings, verdict: review.verdict } };
+  }
+
+  private recordStepMetrics(stepRunId: string, startedAtIso: string): void {
+    if (this.metrics === null) return;
+    this.metrics.recordStepDuration(stepRunId, Math.max(0, Date.parse(this.now()) - Date.parse(startedAtIso)));
   }
 
   /** A concurrent cancel() may have marked this step CANCELLED mid-flight; never overwrite that. */

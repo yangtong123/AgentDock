@@ -12,6 +12,7 @@ export interface WorkflowRepository {
   createStep(step:StepRun):StepRun;
   listSteps(workflowRunId:string):StepRun[];
   updateStep(id:string,changes:StepRunChanges):StepRun;
+  updateSequence(id:string,sequence:number,updatedAt:string):void;
 }
 export class SqliteWorkflowRepository implements WorkflowRepository {
   constructor(private readonly db:Database){}
@@ -21,4 +22,5 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
   createStep(s:StepRun):StepRun { this.db.prepare("INSERT INTO step_runs (id,workflow_run_id,step_type,state,provider,sequence,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(s.id,s.workflowRunId,s.stepType,s.state,s.provider,s.sequence,s.createdAt,s.updatedAt); return s; }
   listSteps(id:string):StepRun[] { return (this.db.prepare("SELECT * FROM step_runs WHERE workflow_run_id=? ORDER BY sequence").all(id) as StepRow[]).map(r=>({id:r.id,workflowRunId:r.workflow_run_id,stepType:r.step_type,state:r.state,provider:r.provider,sequence:r.sequence,createdAt:r.created_at,updatedAt:r.updated_at})); }
   updateStep(id:string,changes:StepRunChanges):StepRun { const sets:string[]=[]; const values:(string|null)[]=[]; if(changes.state!==undefined){sets.push("state = ?");values.push(changes.state);} sets.push("updated_at = ?"); values.push(changes.updatedAt??new Date().toISOString()); const result=this.db.prepare(`UPDATE step_runs SET ${sets.join(", ")} WHERE id = ?`).run(...values,id); if(result.changes!==1) throw new NotFoundError(`StepRun ${id} not found`); const r=this.db.prepare("SELECT * FROM step_runs WHERE id=?").get(id) as StepRow; return {id:r.id,workflowRunId:r.workflow_run_id,stepType:r.step_type,state:r.state,provider:r.provider,sequence:r.sequence,createdAt:r.created_at,updatedAt:r.updated_at}; }
+  updateSequence(id:string,sequence:number,updatedAt:string):void { this.db.prepare("UPDATE step_runs SET sequence = ?, updated_at = ? WHERE id = ?").run(sequence,updatedAt,id); }
 }

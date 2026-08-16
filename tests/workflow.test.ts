@@ -39,7 +39,7 @@ interface Harness {
   db: ReturnType<typeof openDatabase>;
 }
 
-function harness(agentBehavior: (role: string) => { fail: boolean } = () => ({ fail: false })): Harness {
+function harness(agentBehavior: (role: string) => { fail: boolean } = () => ({ fail: false }), reviewStdout = "No blocking issues.\nVERDICT: PASS"): Harness {
   const base = mkdtempSync(join(tmpdir(), "agentdock-wf-"));
   createRepository(join(base, "repo"));
   const db = openDatabase(":memory:");
@@ -53,7 +53,8 @@ function harness(agentBehavior: (role: string) => { fail: boolean } = () => ({ f
     async run(context) {
       calls.push({ step: context.role, provider, context });
       if (agentBehavior(context.role).fail) return { exitCode: 1, stdout: "", stderr: "boom", externalSessionId: null, resumed: false };
-      return { exitCode: 0, stdout: `${context.role}:${provider} findings`, stderr: "", externalSessionId: `sess-${context.role}`, resumed: false };
+      const stdout = context.role === "REVIEW" ? reviewStdout : `${context.role}:${provider} done`;
+      return { exitCode: 0, stdout, stderr: "", externalSessionId: `sess-${context.role}`, resumed: false };
     },
   }), join(base, "artifacts"));
   const engine = new WorkflowEngine(app.repositories.workflows, taskRepo, app.repositories.projects, runtime, new ProcessRunner());
@@ -174,18 +175,29 @@ test("workflows only start from READY tasks", async () => {
   } finally { h.db.close(); rmSync(h.base, { recursive: true, force: true }); }
 });
 
-test("cross-review runs all agent steps with per-step providers and feeds review findings into FIX", async () => {
+test("cross-review runs agent steps with per-step providers and skips FIX on a passing review", async () => {
   const h = harness();
   try {
     const taskId = await readyTask(h);
     const started = await h.engine.start({ taskId, preset: "cross-review" });
     const done = await h.engine.execute(started.run.id);
     assert.equal(done.run.state, "SUCCEEDED");
-    assert.deepEqual(h.calls.map((c) => c.step), ["IMPLEMENT", "REVIEW", "FIX", "FINAL_REVIEW"]);
-    assert.deepEqual(h.calls.map((c) => c.provider), ["claude", "codex", "claude", "codex"]);
+    assert.deepEqual(h.calls.map((c) => c.step), ["IMPLEMENT", "REVIEW", "FINAL_REVIEW"]);
+    assert.deepEqual(h.calls.map((c) => c.provider), ["claude", "codex", "codex"]);
+  } finally { h.db.close(); rmSync(h.base, { recursive: true, force: true }); }
+});
+
+test("cross-review FIX receives structured findings when the review reports issues", async () => {
+  const h = harness(undefined, "FINDING [MAJOR] src/a.ts:1 something to fix\nVERDICT: NEEDS_FIXES");
+  try {
+    const taskId = await readyTask(h);
+    const started = await h.engine.start({ taskId, preset: "cross-review" });
+    const done = await h.engine.execute(started.run.id);
+    // Review keeps reporting the same finding: the bounded loop fails after maxReviewRounds.
+    assert.equal(done.run.state, "FAILED");
     const fixPrompt = h.calls.find((c) => c.step === "FIX")!.context.prompt;
-    assert.match(fixPrompt, /Findings from the previous review:/);
-    assert.match(fixPrompt, /REVIEW:codex findings/);
+    assert.match(fixPrompt, /Open findings from the latest review:/);
+    assert.match(fixPrompt, /\[MAJOR\] src\/a\.ts:1 something to fix/);
   } finally { h.db.close(); rmSync(h.base, { recursive: true, force: true }); }
 });
 

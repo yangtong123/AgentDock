@@ -57,7 +57,7 @@ function harness(agentBehavior: (role: string) => { fail: boolean } = () => ({ f
       return { exitCode: 0, stdout, stderr: "", externalSessionId: `sess-${context.role}`, resumed: false };
     },
   }), join(base, "artifacts"));
-  const engine = new WorkflowEngine(app.repositories.workflows, taskRepo, app.repositories.projects, runtime, new ProcessRunner());
+  const engine = new WorkflowEngine(app.repositories.workflows, taskRepo, app.repositories.projects, runtime, new SqliteArtifactRepository(db), new ProcessRunner());
   return { app, engine, calls, base, db };
 }
 

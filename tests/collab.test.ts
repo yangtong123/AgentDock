@@ -89,7 +89,7 @@ function harness(script: Script): Harness {
     calls.push({ role: input.role, provider, resumeThreadId: options?.resumeThreadId, threadId: execution.thread.id, prompt: input.prompt });
     return execution;
   };
-  const engine = new WorkflowEngine(app.repositories.workflows, app.repositories.tasks, app.repositories.projects, runtime, new ProcessRunner());
+  const engine = new WorkflowEngine(app.repositories.workflows, app.repositories.tasks, app.repositories.projects, runtime, new SqliteArtifactRepository(db), new ProcessRunner());
   return { app, engine, calls, base, db, threadRepo };
 }
 
@@ -127,6 +127,52 @@ test("review that passes immediately skips the FIX/VERIFY/re-REVIEW block", asyn
     const roles = h.calls.map((c) => c.role);
     assert.deepEqual(roles, ["IMPLEMENT", "REVIEW", "FINAL_REVIEW"]);
     assert.ok(done.steps.every((s) => s.state === "SUCCEEDED"), "skipped steps must still record SUCCEEDED");
+  } finally { h.db.close(); rmSync(h.base, { recursive: true, force: true }); }
+});
+
+test("maxReviewRounds is persisted on the run and bounds the loop across it", async () => {
+  const findings = "FINDING [MAJOR] src/a.ts:1 broken\nVERDICT: NEEDS_FIXES";
+  const h = harness((_call, context) => context.role === "REVIEW" ? { stdout: findings } : {});
+  try {
+    const taskId = await readyTask(h);
+    const started = await h.engine.start({ taskId, preset: "cross-review", maxReviewRounds: 1 });
+    assert.equal(started.run.maxReviewRounds, 1);
+    const done = await h.engine.execute(started.run.id);
+    assert.equal(done.run.state, "FAILED");
+    // First NEEDS_FIXES exhausts the bound immediately: no FIX runs.
+    assert.equal(h.calls.filter((c) => c.role === "REVIEW").length, 1);
+    assert.equal(h.calls.filter((c) => c.role === "FIX").length, 0);
+  } finally { h.db.close(); rmSync(h.base, { recursive: true, force: true }); }
+});
+
+test("findings survive an execute() restart: FIX after resume still sees them", async () => {
+  const findings = "FINDING [MAJOR] src/a.ts:1 fix me\nVERDICT: NEEDS_FIXES";
+  // REVIEW reports findings; the first engine "crashes" right after the review round is appended.
+  const h = harness((call, context) => {
+    if (context.role === "REVIEW" && call === 1) return { stdout: findings }; // call 0 is IMPLEMENT
+    if (context.role === "REVIEW") return { stdout: "VERDICT: PASS" };
+    return {};
+  });
+  try {
+    const taskId = await readyTask(h);
+    const started = await h.engine.start({ taskId, preset: "cross-review" });
+    const runId = started.run.id;
+    // Simulate a process crash after REVIEW: execute() aborts with an unhandled error.
+    const crashEngine = h.engine as unknown as { executeStep: (...args: unknown[]) => Promise<unknown>; execute: (runId: string) => Promise<unknown> };
+    const originalExecuteStep = crashEngine.executeStep.bind(h.engine);
+    crashEngine.executeStep = async (...args: unknown[]) => {
+      const step = args[1] as { stepType: string };
+      if (step.stepType === "FIX") throw new Error("simulated crash");
+      return originalExecuteStep(...args);
+    };
+    await assert.rejects(crashEngine.execute(runId), /simulated crash/);
+    // A fresh engine resumes: findings reload from the persisted artifact.
+    const engine2 = new WorkflowEngine(h.app.repositories.workflows, h.app.repositories.tasks, h.app.repositories.projects, (h.engine as unknown as { runtime: never }).runtime, new SqliteArtifactRepository(h.db), new ProcessRunner());
+    const done = await engine2.execute(runId);
+    assert.equal(done.run.state, "SUCCEEDED");
+    const fixCall = h.calls.find((c) => c.role === "FIX");
+    assert.ok(fixCall, "FIX must run after resume");
+    assert.match(fixCall!.prompt, /Open findings from the latest review:/);
   } finally { h.db.close(); rmSync(h.base, { recursive: true, force: true }); }
 });
 

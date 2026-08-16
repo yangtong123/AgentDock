@@ -4,6 +4,7 @@ import { NotFoundError, ValidationError } from "../shared/domain.js";
 import type { WorkflowRepository } from "./workflow-repository.js";
 import type { TaskRepository } from "../tasks/task-repository.js";
 import type { ProjectRepository } from "../projects/project-repository.js";
+import type { ArtifactRepository } from "../artifacts/artifact-repository.js";
 import type { AgentThreadManager } from "../runtime/agent-thread-manager.js";
 import { expandPreset, DEFAULT_PROVIDERS, type ProviderAssignment } from "./presets.js";
 import { ProcessRunner } from "../runtime/process-runner.js";
@@ -45,6 +46,7 @@ export class WorkflowEngine {
     private readonly tasks: TaskRepository,
     private readonly projects: ProjectRepository,
     private readonly runtime: AgentThreadManager,
+    private readonly artifacts: ArtifactRepository,
     private readonly verifyRunner: ProcessRunner,
     private readonly baseEnv: NodeJS.ProcessEnv = process.env,
     private readonly now = () => new Date().toISOString(),
@@ -60,7 +62,7 @@ export class WorkflowEngine {
     validateMaxReviewRounds(input.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS);
 
     const timestamp = this.now();
-    const run: WorkflowRun = { id: randomUUID(), taskRevisionId: revision.id, preset: input.preset, state: "QUEUED", createdAt: timestamp, updatedAt: timestamp };
+    const run: WorkflowRun = { id: randomUUID(), taskRevisionId: revision.id, preset: input.preset, state: "QUEUED", maxReviewRounds: input.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS, createdAt: timestamp, updatedAt: timestamp };
     this.workflows.createRun(run);
     this.tasks.update(task.id, { state: "RUNNING" }, timestamp);
     for (const [index, step] of steps.entries()) {
@@ -73,20 +75,23 @@ export class WorkflowEngine {
     this.requireResumable(runId);
     const { task, revision } = this.contextForRun(runId);
     const stepTimeoutMs = this.stepTimeoutMs();
-    const maxRounds = DEFAULT_MAX_REVIEW_ROUNDS;
+    const run = this.requireRun(runId);
+    const maxRounds = run.maxReviewRounds;
 
     this.workflows.updateRun(runId, { state: "RUNNING", updatedAt: this.now() });
     const threads = new Map<string, string>(); // role -> thread id, for RESUME session policy
-    let reviewRound = 0;
-    let openFindings: ReviewFinding[] = [];
-    let reviewProvider: string | null = null;
-    let fixProvider: string | null = null;
+    let fixProvider = this.workflows.listSteps(runId).find((s) => s.stepType === "FIX")?.provider ?? null;
+    let reviewProvider = this.workflows.listSteps(runId).find((s) => s.stepType === "REVIEW")?.provider ?? null;
+    // Findings survive in the task's review artifacts; load the latest REVIEW's findings.
+    let openFindings = await this.latestReviewFindings(run, task.id);
     while (true) {
       const steps = this.workflows.listSteps(runId);
       const next = steps.find((step) => step.state !== "SUCCEEDED" && step.state !== "CANCELLED");
       if (next === undefined) break;
       // Re-check run state each iteration: a concurrent cancel()/approve() must win.
       if (this.requireRun(runId).state === "CANCELLED") return this.status(runId);
+      // Loop bound derives from durable REVIEW steps, so crash/resume can never exceed it.
+      const reviewRound = steps.filter((s) => s.stepType === "REVIEW" && s.state === "SUCCEEDED").length;
 
       if (next.stepType === "FIX" && openFindings.length === 0) {
         // Review passed: the first FIX and everything up to FINAL_REVIEW is unnecessary.
@@ -102,16 +107,20 @@ export class WorkflowEngine {
       if (outcome.state === "FAILED") return this.finishIfNotCancelled(runId, task, "FAILED");
       if (next.stepType === "REVIEW") {
         reviewProvider = next.provider;
-        openFindings = outcome.review?.findings ?? [];
-        if (openFindings.length > 0) {
-          reviewRound++;
-          if (reviewRound >= maxRounds) {
+        const needsFixes = outcome.review?.verdict === "NEEDS_FIXES";
+        openFindings = needsFixes ? (outcome.review?.findings ?? []) : [];
+        if (needsFixes) {
+          await this.persistFindings(run, task.id, next.id, outcome.review!.findings);
+          // reviewRound was snapshotted before this REVIEW succeeded; this run is the latest round.
+          if (reviewRound + 1 >= maxRounds) {
             // Bounded loop exhausted: fail instead of reviewing forever.
-            this.workflows.updateStep(next.id, { state: "FAILED", updatedAt: this.now() });
+            this.stepStateUnlessCancelled(runId, next.id, "FAILED");
             return this.finishIfNotCancelled(runId, task, "FAILED");
           }
           // Another round: append FIX -> VERIFY -> REVIEW before FINAL_REVIEW.
           this.appendLoopRound(runId, next, reviewProvider, fixProvider);
+        } else {
+          openFindings = [];
         }
       }
       if (next.stepType === "FIX") fixProvider = next.provider;
@@ -121,6 +130,8 @@ export class WorkflowEngine {
 
   /** Dynamically appends one bounded FIX->VERIFY->REVIEW round after the anchor step. */
   private appendLoopRound(runId: string, anchor: StepRun, reviewProvider: string | null, fixProvider: string | null): void {
+    // A concurrent cancel() wins: never mutate a cancelled run's plan.
+    if (this.requireRun(runId).state === "CANCELLED") return;
     const timestamp = this.now();
     const ordered = this.workflows.listSteps(runId).sort((a, b) => a.sequence - b.sequence);
     const anchorIndex = ordered.findIndex((s) => s.id === anchor.id);
@@ -131,13 +142,26 @@ export class WorkflowEngine {
       id: randomUUID(), sequence: before.length + index, stepType,
       provider: stepType === "FIX" ? (fixProvider ?? DEFAULT_PROVIDERS.FIX) : stepType === "REVIEW" ? (reviewProvider ?? DEFAULT_PROVIDERS.REVIEW) : null,
     }));
-    // Rewrite every sequence at once via a temporary high range to dodge the UNIQUE constraint.
     const finalOrder = [...before, ...roundSteps, ...tails];
-    for (const [index, step] of finalOrder.entries()) this.workflows.updateSequence(step.id, 1000 + index, timestamp);
-    for (const [index, step] of finalOrder.entries()) this.workflows.updateSequence(step.id, index, timestamp);
-    for (const step of roundSteps) {
-      this.workflows.createStep({ id: step.id, workflowRunId: runId, stepType: step.stepType, state: "QUEUED", provider: step.provider, sequence: step.sequence, createdAt: timestamp, updatedAt: timestamp });
+    // Create the new steps at tail-end sequences first (no collision), then reorder atomically.
+    const base = ordered.length ? Math.max(...ordered.map((s) => s.sequence)) + 1 : 0;
+    for (const [index, step] of roundSteps.entries()) {
+      this.workflows.createStep({ id: step.id, workflowRunId: runId, stepType: step.stepType, state: "QUEUED", provider: step.provider, sequence: base + index, createdAt: timestamp, updatedAt: timestamp });
     }
+    this.workflows.reorderSteps(runId, finalOrder.map((s) => s.id));
+  }
+
+  /** Findings are durable: stored as an INLINE artifact so crash/resume keeps the FIX prompt intact. */
+  private async persistFindings(run: WorkflowRun, taskId: string, stepRunId: string, findings: ReviewFinding[]): Promise<void> {
+    this.artifacts.create({ id: randomUUID(), taskId, workflowRunId: run.id, stepRunId, kind: "review-findings", name: "review-findings", storage: { type: "INLINE", content: JSON.stringify(findings) }, createdAt: this.now() });
+  }
+
+  private async latestReviewFindings(run: WorkflowRun, taskId: string): Promise<ReviewFinding[]> {
+    const artifacts = this.artifacts.listForTask(taskId).filter((a) => a.kind === "review-findings" && a.workflowRunId === run.id && a.storage.type === "INLINE");
+    if (artifacts.length === 0) return [];
+    const latest = artifacts[artifacts.length - 1]!;
+    const storage = latest.storage as { type: "INLINE"; content: string };
+    try { return JSON.parse(storage.content) as ReviewFinding[]; } catch { return []; }
   }
 
   /** Terminal transition that yields to a concurrent cancel: never overwrite CANCELLED. */
@@ -183,7 +207,7 @@ export class WorkflowEngine {
     return { run, steps, awaitingApproval };
   }
 
-  private async executeStep(runId: string, step: StepRun, task: Task, revision: TaskRevision, openFindings: ReviewFinding[], threads: Map<string, string>, stepTimeoutMs: number): Promise<{ state: "SUCCEEDED" | "FAILED" | "PAUSED"; paused?: boolean; review?: { findings: ReviewFinding[] } }> {
+  private async executeStep(runId: string, step: StepRun, task: Task, revision: TaskRevision, openFindings: ReviewFinding[], threads: Map<string, string>, stepTimeoutMs: number): Promise<{ state: "SUCCEEDED" | "FAILED" | "PAUSED"; paused?: boolean; review?: { findings: ReviewFinding[]; verdict: "PASS" | "NEEDS_FIXES" } }> {
     this.workflows.updateStep(step.id, { state: "RUNNING", updatedAt: this.now() });
     if (step.stepType === "HUMAN_APPROVAL") {
       // External gate: park the step back at QUEUED and surface PAUSED to the caller.
@@ -212,7 +236,7 @@ export class WorkflowEngine {
       ? parseReviewReport(execution.outcome?.stdout ?? "")
       : undefined;
     if (review === undefined) return { state: ok ? "SUCCEEDED" : "FAILED" };
-    return { state: ok ? "SUCCEEDED" : "FAILED", review: { findings: review.findings } };
+    return { state: ok ? "SUCCEEDED" : "FAILED", review: { findings: review.findings, verdict: review.verdict } };
   }
 
   /** A concurrent cancel() may have marked this step CANCELLED mid-flight; never overwrite that. */

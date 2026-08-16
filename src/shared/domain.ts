@@ -23,7 +23,7 @@ export interface Task {
 }
 export interface TaskRevision { id: string; taskId: string; revision: number; request: string; createdAt: string; }
 export interface TaskDetails { task: Task; currentRevision: TaskRevision; revisions: TaskRevision[]; }
-export interface WorkflowRun { id: string; taskRevisionId: string; preset: string | null; state: RunState; createdAt: string; updatedAt: string; }
+export interface WorkflowRun { id: string; taskRevisionId: string; preset: string | null; state: RunState; maxReviewRounds: number; createdAt: string; updatedAt: string; }
 export interface StepRun { id: string; workflowRunId: string; stepType: StepType; state: RunState; provider: string | null; sequence: number; createdAt: string; updatedAt: string; }
 export interface AgentThread { id: string; taskId: string; provider: string; role: string; externalSessionId: string | null; createdAt: string; updatedAt: string; }
 export type ArtifactStorage = { type: "INLINE"; content: string } | { type: "FILE"; path: string };

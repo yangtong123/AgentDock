@@ -31,7 +31,7 @@ export function createApplication(db:Database, options:{ agents?: Record<string,
     tasks,
     worktrees,
     runtime,
-    workflows:new WorkflowEngine(workflowRepository,taskRepository,projectRepository,runtime,runner),
+    workflows:new WorkflowEngine(workflowRepository,taskRepository,projectRepository,runtime,artifactRepository,runner),
     repositories:{projects:projectRepository,tasks:taskRepository,workflows:workflowRepository,agentThreads:agentThreadRepository,artifacts:artifactRepository},
   };
 }

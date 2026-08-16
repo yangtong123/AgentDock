@@ -1,0 +1,19 @@
+node_modules/
+dist/
+coverage/
+*.log
+
+# Local runtime state
+data/
+worktrees/
+.ai-work/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

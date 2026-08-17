@@ -46,15 +46,14 @@ export class ImController {
     this.adapters.set(adapter.name, adapter);
   }
 
-  /** Conversation origin tracking row type: adapter = 'origin', project_id holds the adapter name. */
-  private static readonly ORIGIN_ADAPTER = "origin";
-
-  /** Remembers which adapter a conversation came from, durably (survives restarts). */
+  /** Remembers which adapter a conversation came from, durably (survives restarts).
+   *  Keyed on the real adapter name: telegram and feishu rows coexist even
+   *  when both platforms use the same conversationId. */
   private rememberConversationAdapter(conversationId: string, adapterName: string): void {
-    this.db.prepare(`INSERT INTO im_conversations (conversation_id, adapter, project_id, focused_task_id, updated_at)
-      VALUES (?, ?, ?, NULL, ?)
-      ON CONFLICT (conversation_id, adapter) DO UPDATE SET project_id = excluded.project_id, updated_at = excluded.updated_at`)
-      .run(conversationId, ImController.ORIGIN_ADAPTER, adapterName, this.now());
+    this.db.prepare(`INSERT INTO im_conversation_origins (conversation_id, adapter, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT (conversation_id, adapter) DO UPDATE SET updated_at = excluded.updated_at`)
+      .run(conversationId, adapterName, this.now());
     this.conversationOrigins.set(conversationId, adapterName);
   }
 
@@ -62,10 +61,10 @@ export class ImController {
   private originAdapterOf(conversationId: string): string | undefined {
     const memory = this.conversationOrigins.get(conversationId);
     if (memory !== undefined) return memory;
-    const row = this.db.prepare("SELECT project_id FROM im_conversations WHERE conversation_id = ? AND adapter = ?").get(conversationId, ImController.ORIGIN_ADAPTER) as { project_id: string | null } | undefined;
-    if (row?.project_id != null) {
-      this.conversationOrigins.set(conversationId, row.project_id);
-      return row.project_id;
+    const row = this.db.prepare("SELECT adapter FROM im_conversation_origins WHERE conversation_id = ? ORDER BY updated_at DESC LIMIT 1").get(conversationId) as { adapter: string } | undefined;
+    if (row?.adapter != null) {
+      this.conversationOrigins.set(conversationId, row.adapter);
+      return row.adapter;
     }
     return undefined;
   }

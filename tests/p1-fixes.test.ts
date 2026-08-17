@@ -192,6 +192,45 @@ test("markProcessed refuses a worker that does not hold the claim", () => {
   db.close();
 });
 
+test("same conversationId on two platforms keeps separate subscriptions and origins", async () => {
+  const f = fixture();
+  try {
+    // Same conversationId from both adapters: two durable origin rows coexist.
+    await f.controller.handle({ type: "LIST_PROJECTS", conversationId: "shared-1" }, "telegram");
+    await f.controller.handle({ type: "LIST_PROJECTS", conversationId: "shared-1" }, "feishu");
+    const origins = f.db.prepare("SELECT adapter FROM im_conversation_origins WHERE conversation_id = ? ORDER BY adapter").all("shared-1") as { adapter: string }[];
+    assert.deepEqual(origins.map((o) => o.adapter), ["feishu", "telegram"], "both origin rows survive");
+
+    // Both subscribe to the same task: two subscription rows, correct adapters.
+    const dispatcher = f.dispatcher;
+    dispatcher.subscribe("shared-1", "task-x", "telegram");
+    dispatcher.subscribe("shared-1", "task-x", "feishu");
+    const subs = f.db.prepare("SELECT adapter FROM im_task_subscriptions WHERE conversation_id = ? AND task_id = ? ORDER BY adapter").all("shared-1", "task-x") as { adapter: string }[];
+    assert.deepEqual(subs.map((s2) => s2.adapter), ["feishu", "telegram"], "subscriptions do not overwrite each other");
+  } finally { await f.orchestrator.stop(); f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("crash-recovered fix run unbinds its triggers for retry", async () => {
+  const f = fixture();
+  try {
+    const taskId = await readyTask(f);
+    f.app.repositories.tasks.update(taskId, { state: "FAILED" }, new Date().toISOString());
+    f.db.prepare(`INSERT INTO github_fix_events (id, task_id, pr_number, reason, detail, created_at) VALUES (?,?,?,?,?,?)`)
+      .run(randomUUID(), taskId, 42, "CI_FAILURE", JSON.stringify(["build"]), new Date().toISOString());
+    const { runId } = await f.app.github.startFixWorkflow(taskId, (input) => f.app.workflows.start(input));
+    assert.equal(f.app.github.pendingFixTriggers(taskId).length, 0, "bound while the run is in flight");
+    // Simulate a worker crash mid-fix followed by orphan recovery cancelling the run.
+    f.app.repositories.tasks.update(taskId, { state: "RUNNING" }, new Date().toISOString());
+    f.app.workflows.cancel(runId);
+    f.app.repositories.tasks.update(taskId, { state: "FAILED" }, new Date().toISOString());
+    f.orchestrator.reapFinishedFixRuns();
+    assert.equal(f.app.github.pendingFixTriggers(taskId).length, 1, "cancelled fix run unbinds triggers for retry");
+    // And the next sweep starts a fresh fix run.
+    const started2 = await f.orchestrator.runPendingFixes();
+    assert.equal(started2.length, 1);
+  } finally { await f.orchestrator.stop(); f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test("step timeout persists on the run and executes use it", async () => {
   const f = fixture();
   try {

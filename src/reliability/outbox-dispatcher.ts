@@ -34,24 +34,22 @@ export class OutboxDispatcher {
     private readonly now = () => new Date().toISOString(),
   ) {}
 
-  private static readonly SUB_ADAPTER = "subscription";
-
   /**
-   * Records which conversation to notify about a task. Subscriptions are
-   * scoped to (conversation, adapter): two platforms using the same
-   * conversation id never receive each other's notifications.
+   * Records which conversation to notify about a task. Rows key on the real
+   * adapter name: telegram and feishu subscriptions for the same task coexist
+   * even when both platforms use the same conversation id.
    */
   subscribe(conversationId: string, taskId: string, adapter: string | null): void {
-    this.db.prepare(`INSERT INTO im_conversations (conversation_id, adapter, project_id, focused_task_id, updated_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT (conversation_id, adapter) DO UPDATE SET focused_task_id = excluded.focused_task_id, updated_at = excluded.updated_at`)
-      .run(conversationId, OutboxDispatcher.SUB_ADAPTER, adapter, taskId, this.now());
+    this.db.prepare(`INSERT INTO im_task_subscriptions (conversation_id, adapter, task_id, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT (conversation_id, adapter) DO UPDATE SET task_id = excluded.task_id, updated_at = excluded.updated_at`)
+      .run(conversationId, adapter ?? "", taskId, this.now());
   }
 
   private subscribersFor(taskId: string | null): { conversationId: string; adapter: string | null }[] {
     if (taskId === null) return [];
-    return (this.db.prepare("SELECT conversation_id, project_id FROM im_conversations WHERE adapter = ? AND focused_task_id = ?").all(OutboxDispatcher.SUB_ADAPTER, taskId) as { conversation_id: string; project_id: string | null }[])
-      .map((row) => ({ conversationId: row.conversation_id, adapter: row.project_id }));
+    return (this.db.prepare("SELECT conversation_id, adapter FROM im_task_subscriptions WHERE task_id = ?").all(taskId) as { conversation_id: string; adapter: string }[])
+      .map((row) => ({ conversationId: row.conversation_id, adapter: row.adapter === "" ? null : row.adapter }));
   }
 
   async start(): Promise<void> {

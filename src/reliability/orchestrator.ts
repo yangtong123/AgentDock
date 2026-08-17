@@ -153,6 +153,7 @@ export class Orchestrator {
       if (this.clock.now().getTime() - lastReap >= 5 * pollMs) {
         lastReap = this.clock.now().getTime();
         this.recoverOrphans();
+        this.reapFinishedFixRuns();
         void this.runPendingFixes().catch(() => undefined);
       }
       const entry = this.queue.nextDue(
@@ -188,16 +189,40 @@ export class Orchestrator {
       if (activeRun === null) throw new Error(`Task ${taskId} has no run to execute`);
       const status = await this.app.workflows.execute(activeRun);
       this.outbox.publish({ taskId, workflowRunId: activeRun, type: `run.${status.run.state.toLowerCase()}`, payload: { taskId, runId: activeRun, state: status.run.state } });
-      // Fix-trigger lifecycle: a SUCCEEDED fix run consumed its CI/review
-      // feedback — clear it; a FAILED/CANCELLED run unbinds so the next sweep retries.
-      if (status.run.state === "SUCCEEDED") this.app.github.clearConsumedTriggers(activeRun);
-      else if (status.run.state === "FAILED" || status.run.state === "CANCELLED") this.db.prepare("UPDATE github_fix_events SET consumed_by_run = NULL WHERE consumed_by_run = ?").run(activeRun);
     } catch (error) {
       this.outbox.publish({ taskId, type: "run.worker-error", payload: { taskId, message: error instanceof Error ? error.message : String(error) } });
+      // execute() threw (crash, worker error): the run is left non-terminal.
+      // Trigger reaping below is durable-state driven, so it settles this run
+      // on the next poll loop once the engine records its terminal state.
     } finally {
       clearTimeout(timeout);
       clearInterval(heartbeat);
       this.leases.release(leaseKey, this.workerId);
+      this.reapFinishedFixRuns();
+    }
+  }
+
+  /**
+   * Fix-trigger lifecycle, driven by durable run state rather than call sites:
+   * a run bound to triggers is settled as soon as it reaches a terminal state —
+   * SUCCEEDED clears its triggers for good; any other terminal state (FAILED,
+   * CANCELLED, including runs cancelled by orphan recovery after a process
+   * crash) unbinds them so the next sweep retries with the same feedback.
+   * Runs still open are left alone. Safe to call repeatedly.
+   */
+  reapFinishedFixRuns(): void {
+    const rows = this.db.prepare(`
+      SELECT DISTINCT consumed_by_run AS runId, r.state AS state
+      FROM github_fix_events f
+      LEFT JOIN workflow_runs r ON r.id = f.consumed_by_run
+      WHERE f.consumed_by_run IS NOT NULL`).all() as { runId: string; state: string | null }[];
+    for (const row of rows) {
+      if (row.state === "SUCCEEDED") {
+        this.app.github.clearConsumedTriggers(row.runId);
+      } else if (row.state === "FAILED" || row.state === "CANCELLED") {
+        this.db.prepare("UPDATE github_fix_events SET consumed_by_run = NULL WHERE consumed_by_run = ?").run(row.runId);
+      }
+      // state null (run row gone) or non-terminal (QUEUED/RUNNING/...): leave bound.
     }
   }
 

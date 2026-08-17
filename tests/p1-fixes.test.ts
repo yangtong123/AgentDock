@@ -81,6 +81,80 @@ test("approval enqueues through the orchestrator instead of inline execute", asy
   } finally { await f.orchestrator.stop(); f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test("an approved run queued for pickup is not orphan-recovered", async () => {
+  const f = fixture();
+  try {
+    const taskId = await readyTask(f);
+    await f.app.workflows.start({ taskId, preset: "careful" });
+    const runId = (f.db.prepare(`SELECT id FROM workflow_runs ORDER BY created_at DESC LIMIT 1`).get() as { id: string }).id;
+    const paused = await f.app.workflows.execute(runId);
+    assert.equal(paused.awaitingApproval, true);
+    // The race window: approved and re-enqueued, but no worker has acquired a
+    // lease yet. Orphan recovery must treat this as pending, not orphaned.
+    await f.controller.handle({ type: "APPROVE_RUN", conversationId: "c1", runId, approved: true });
+    assert.deepEqual(f.orchestrator.recoverOrphans(), []);
+    assert.equal(f.app.tasks.list().find((t) => t.id === taskId)!.state, "RUNNING");
+    assert.equal(f.app.workflows.status(runId).run.state, "RUNNING");
+  } finally { await f.orchestrator.stop(); f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("approval re-enqueue after a crash at the gate is not orphan-recovered", async () => {
+  const f = fixture();
+  try {
+    const taskId = await readyTask(f);
+    await f.app.workflows.start({ taskId, preset: "careful" });
+    const runId = (f.db.prepare(`SELECT id FROM workflow_runs ORDER BY created_at DESC LIMIT 1`).get() as { id: string }).id;
+    const paused = await f.app.workflows.execute(runId);
+    assert.equal(paused.awaitingApproval, true);
+    // The worker died while the run was parked at the gate: its expired lease
+    // row is still there. The paused gate itself is never an orphan...
+    assert.deepEqual(f.orchestrator.recoverOrphans(), []);
+    f.db.prepare("INSERT INTO worker_leases (lease_key, owner, task_id, acquired_at, expires_at) VALUES (?,?,?,?,?)")
+      .run(`task:${taskId}`, "dead-worker", taskId, new Date(Date.now() - 120_000).toISOString(), new Date(Date.now() - 60_000).toISOString());
+    // ...and neither is the fresh re-enqueue after the user approves: the
+    // stale lease row must not turn the pending pickup into an "orphan".
+    await f.controller.handle({ type: "APPROVE_RUN", conversationId: "c1", runId, approved: true });
+    assert.deepEqual(f.orchestrator.recoverOrphans(), []);
+    assert.equal(f.app.tasks.list().find((t) => t.id === taskId)!.state, "RUNNING");
+    assert.equal(f.app.workflows.status(runId).run.state, "RUNNING");
+  } finally { await f.orchestrator.stop(); f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("approval and orphan recovery interlock across two real database connections", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agentdock-p1-"));
+  createRepository(join(base, "repo"));
+  const dbPath = join(base, "shared.db");
+  const fakeAgent = { provider: "fake", async run() { return { exitCode: 0, stdout: "VERDICT: PASS", stderr: "", externalSessionId: "s", resumed: false }; } };
+  const db1 = openDatabase(dbPath);
+  const app1 = createApplication(db1, { agents: { claude: fakeAgent, codex: fakeAgent } });
+  const controller = new ImController(db1, app1);
+  const orch1 = new Orchestrator(db1, app1, app1.processRunner, {});
+  controller.attachOrchestrator(orch1);
+  const db2 = openDatabase(dbPath);
+  const app2 = createApplication(db2, { agents: { claude: fakeAgent, codex: fakeAgent } });
+  const orch2 = new Orchestrator(db2, app2, app2.processRunner, {});
+  try {
+    const project = app1.projects.create({ name: "two-conn", repoPath: join(base, "repo"), worktreeRoot: join(base, "wt") });
+    const { task } = app1.tasks.create(project.id, "request");
+    await app1.worktrees.prepare(task.id);
+    await app1.workflows.start({ taskId: task.id, preset: "careful" });
+    const runId = (db1.prepare(`SELECT id FROM workflow_runs ORDER BY created_at DESC LIMIT 1`).get() as { id: string }).id;
+    const paused = await app1.workflows.execute(runId);
+    assert.equal(paused.awaitingApproval, true);
+    // A dead worker's expired lease at the gate: recovery on the other
+    // connection must leave the paused run alone.
+    db1.prepare("INSERT INTO worker_leases (lease_key, owner, task_id, acquired_at, expires_at) VALUES (?,?,?,?,?)")
+      .run(`task:${task.id}`, "dead-worker", task.id, new Date(Date.now() - 120_000).toISOString(), new Date(Date.now() - 60_000).toISOString());
+    assert.equal(orch2.recoverIfOrphaned(task.id), null, "paused gate is not an orphan across connections");
+    // Approve + enqueue atomically on conn 1; recovery on conn 2 must see the
+    // committed pair, never half of it.
+    await controller.handle({ type: "APPROVE_RUN", conversationId: "c1", runId, approved: true });
+    assert.equal(orch2.recoverIfOrphaned(task.id), null, "approved-and-queued run is not an orphan across connections");
+    assert.equal(app2.tasks.list().find((t) => t.id === task.id)!.state, "RUNNING");
+    assert.equal(app2.workflows.status(runId).run.state, "RUNNING");
+  } finally { db1.close(); db2.close(); rmSync(base, { recursive: true, force: true }); }
+});
+
 test("CI failure triggers reopen -> fix workflow -> orchestrator execution", async () => {
   const f = fixture();
   try {

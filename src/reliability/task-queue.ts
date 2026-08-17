@@ -12,7 +12,13 @@ export class TaskQueue {
   constructor(
     private readonly db: Database,
     private readonly clock: Clock = new SystemClock(),
-  ) { void db; }
+  ) {}
+
+  /** The task's current open run (QUEUED/RUNNING/CANCEL_REQUESTED), newest first. */
+  activeRunId(taskId: string): string | null {
+    const rows = this.db.prepare(`SELECT id FROM workflow_runs WHERE task_revision_id IN (SELECT id FROM task_revisions WHERE task_id = ?) AND state IN ('QUEUED','RUNNING','CANCEL_REQUESTED') ORDER BY created_at DESC`).all(taskId) as { id: string }[];
+    return rows[0]?.id ?? null;
+  }
 
   enqueue(taskId: string, options: { priority?: number; scheduledAt?: Date } = {}): QueueEntry {
     const priority = options.priority ?? 5;

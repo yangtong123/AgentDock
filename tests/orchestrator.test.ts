@@ -27,22 +27,26 @@ interface Fixture {
   orchestrator: Orchestrator;
   clock: Clock & { advance(ms: number): void };
   runtime: AgentThreadManager;
+  runner: ProcessRunner;
 }
 
-function fixture(options: { pollMs?: number } = {}): Fixture {
+function fixture(options: { pollMs?: number; agent?: { provider: string; run(): Promise<{ exitCode: number; stdout: string; stderr: string; externalSessionId: string; resumed: boolean }> } } = {}): Fixture {
   const base = mkdtempSync(join(tmpdir(), "agentdock-orch-"));
   createRepository(join(base, "repo"));
   const db = openDatabase(":memory:");
   const app = createApplication(db);
   const clock = fakeClock(Date.UTC(2026, 0, 1));
   // Fake agents so no real CLI runs.
-  const fakeAgent = { provider: "fake", async run() { return { exitCode: 0, stdout: "VERDICT: PASS", stderr: "", externalSessionId: "s", resumed: false }; } };
+  const fakeAgent = options.agent ?? { provider: "fake", async run() { return { exitCode: 0, stdout: "VERDICT: PASS", stderr: "", externalSessionId: "s", resumed: false }; } };
   const runtime = new AgentThreadManager(new SqliteAgentThreadRepository(db), new SqliteArtifactRepository(db), new SqliteTaskRepository(db), () => fakeAgent, join(base, "artifacts"));
+  // One shared runner, like production: the orchestrator's cancel/timeout must
+  // reach the engine's agent and verify processes.
+  const runner = new ProcessRunner();
   // Swap in the fake runtime by rebuilding the engine with it.
-  const fakeEngine = new WorkflowEngine(app.repositories.workflows, app.repositories.tasks, app.repositories.projects, runtime, new SqliteArtifactRepository(db), new ProcessRunner(), process.env, () => clock.now().toISOString());
+  const fakeEngine = new WorkflowEngine(app.repositories.workflows, app.repositories.tasks, app.repositories.projects, runtime, new SqliteArtifactRepository(db), runner, process.env, () => clock.now().toISOString());
   (app as unknown as Record<string, unknown>).workflows = fakeEngine;
-  const orchestrator = new Orchestrator(db, app, new ProcessRunner(), { pollMs: options.pollMs ?? 10 }, clock);
-  return { base, db, app, orchestrator, clock, runtime };
+  const orchestrator = new Orchestrator(db, app, runner, { pollMs: options.pollMs ?? 10 }, clock);
+  return { base, db, app, orchestrator, clock, runtime, runner };
 }
 
 async function queuedTask(f: Fixture, request = "do it"): Promise<string> {
@@ -69,8 +73,47 @@ test("orchestrator runs a queued task to completion under a lease", async () => 
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });
 
-test("orchestrator.once executes an action exactly once", async () => {
+test("stop() waits for in-flight tasks to settle after cancellation", async () => {
+  let releaseAgent!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseAgent = resolve; });
+  const blockingAgent = { provider: "fake", async run() { await gate; return { exitCode: 0, stdout: "VERDICT: PASS", stderr: "", externalSessionId: "s", resumed: false }; } };
+  const f = fixture({ pollMs: 10, agent: blockingAgent });
+  try {
+    const taskId = await queuedTask(f);
+    await f.orchestrator.start();
+    // Wait until the run is actually executing its first step.
+    for (let i = 0; i < 100; i++) {
+      const running = f.db.prepare("SELECT COUNT(*) c FROM step_runs WHERE state = 'RUNNING'").get() as { c: number };
+      if (running.c > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    let stopped = false;
+    const stopPromise = f.orchestrator.stop().then(() => { stopped = true; });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(stopped, false, "stop must wait for the in-flight runTask, not just the poll loop");
+    releaseAgent();
+    await stopPromise;
+    assert.equal(stopped, true);
+    assert.equal(f.orchestrator.queue.size(), 0);
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("activeRunId distinguishes the current open run from a stale terminal one", async () => {
   const f = fixture();
+  try {
+    const taskId = await queuedTask(f);
+    const staleRunId = f.orchestrator.queue.activeRunId(taskId)!;
+    assert.notEqual(staleRunId, null);
+    f.app.workflows.cancel(staleRunId);
+    f.app.repositories.tasks.update(taskId, { state: "READY" }, f.clock.now().toISOString());
+    const started = f.app.workflows.start({ taskId, preset: "fast" });
+    f.orchestrator.queue.enqueue(taskId);
+    assert.equal(f.orchestrator.queue.activeRunId(taskId), started.run.id, "the newer run is the active one");
+    assert.notEqual(f.orchestrator.queue.activeRunId(taskId), staleRunId, "a stale run-id must not be accepted as active");
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("orchestrator.once executes an action exactly once", async () => {  const f = fixture();
   try {
     let executions = 0;
     const action = async () => { executions++; };
@@ -80,18 +123,106 @@ test("orchestrator.once executes an action exactly once", async () => {
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test("task timeout during VERIFY settles FAILED, not CANCELLED", async () => {
+  const f = fixture({ pollMs: 10 });
+  // Real clock here: the fake clock never advances, and periodic reaping
+  // after the timeout is exactly what this test exercises.
+  const orch = new Orchestrator(f.db, f.app, f.runner, { pollMs: 10, taskTimeoutMs: 300 });
+  try {
+    const project = f.app.projects.create({ name: `p-${Math.random().toString(36).slice(2)}`, repoPath: join(f.base, "repo"), worktreeRoot: join(f.base, "wt"), verifyCommand: [process.execPath, "-e", "setTimeout(() => {}, 60000)"] });
+    const { task } = f.app.tasks.create(project.id, "slow verify");
+    await f.app.worktrees.prepare(task.id);
+    f.app.workflows.start({ taskId: task.id, preset: "fast" });
+    f.orchestrator.queue.enqueue(task.id);
+    await orch.start();
+    const deadline = Date.now() + 10_000;
+    let state = "";
+    while (Date.now() < deadline) {
+      state = f.app.tasks.list().find((t) => t.id === task.id)!.state;
+      if (state === "FAILED" || state === "CANCELLED") break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(state, "FAILED", "a timed-out task is FAILED (retryable by the fix loop), never masquerades as a user cancel");
+    const events = f.db.prepare("SELECT type FROM outbox_events WHERE task_id = ?").all(task.id) as { type: string }[];
+    assert.ok(events.some((e) => e.type === "task.timeout"), `timeout event published: ${JSON.stringify(events)}`);
+  } finally { await orch.stop(); f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("claimInlineRun enforces the scheduling gate and active-run validation", async () => {
+  const f = fixture();
+  try {
+    const taskId = await queuedTask(f);
+    const runId = f.orchestrator.queue.activeRunId(taskId)!;
+    const projectId = f.app.tasks.list().find((t) => t.id === taskId)!.projectId;
+    // PAUSED project: refused before touching lease or queue.
+    f.app.projects.setStatus(projectId, "PAUSED");
+    assert.throws(() => f.orchestrator.claimInlineRun(taskId, runId, "cli-test", 60_000), /PAUSED/);
+    assert.equal(f.orchestrator.queue.size(), 1, "queue entry survives a refused claim");
+    f.app.projects.setStatus(projectId, "ACTIVE");
+    // Stale run-id: refused, entry survives, lease released.
+    assert.throws(() => f.orchestrator.claimInlineRun(taskId, "00000000-0000-0000-0000-000000000000", "cli-test", 60_000), /not the task's active run/);
+    assert.equal(f.orchestrator.queue.size(), 1);
+    // Happy path: lease held, entry consumed, heartbeat works, release clean.
+    const claim = f.orchestrator.claimInlineRun(taskId, runId, "cli-test", 60_000);
+    assert.equal(f.orchestrator.queue.size(), 0, "claim consumes the pending signal");
+    assert.equal(claim.heartbeat(), "ok");
+    claim.release();
+    assert.equal(claim.heartbeat(), "lost", "released lease cannot heartbeat");
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
 test("recoverOrphans fails RUNNING tasks with dead leases and cancels their runs", async () => {
   const f = fixture();
   try {
     const taskId = await queuedTask(f);
-    // Simulate a crashed worker: task RUNNING, run RUNNING, no lease.
+    // Simulate a crashed worker mid-step: the queue entry was consumed at
+    // claim time, and the dead worker left an expired lease row behind (a
+    // clean release deletes the row).
+    f.orchestrator.queue.dequeue(taskId);
     f.app.repositories.tasks.update(taskId, { state: "RUNNING" }, f.clock.now().toISOString());
     const runId = (f.db.prepare(`SELECT id FROM workflow_runs WHERE task_revision_id IN (SELECT id FROM task_revisions WHERE task_id = ?)`).all(taskId) as { id: string }[])[0]!.id;
     f.db.prepare("UPDATE workflow_runs SET state = 'RUNNING' WHERE id = ?").run(runId);
+    f.db.prepare("INSERT INTO worker_leases (lease_key, owner, task_id, acquired_at, expires_at) VALUES (?,?,?,?,?)")
+      .run(`task:${taskId}`, "dead-worker", taskId, f.clock.now().toISOString(), new Date(f.clock.now().getTime() - 1_000).toISOString());
     const recovered = f.orchestrator.recoverOrphans();
     assert.equal(recovered.length, 1);
     assert.equal(recovered[0]!.taskId, taskId);
     assert.equal(f.app.tasks.list().find((t) => t.id === taskId)!.state, "FAILED");
+    assert.equal(f.app.workflows.status(runId).run.state, "CANCELLED");
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("recoverIfOrphaned never downgrades a completed task, even with no lease or queue entry", async () => {
+  const f = fixture();
+  try {
+    const taskId = await queuedTask(f);
+    await f.orchestrator.start();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await f.orchestrator.stop();
+    // Terminal state, no lease, no queue entry — the exact end state of the
+    // "candidate selected, then the run finished" race. The in-transaction
+    // predicate must refuse to classify it as an orphan.
+    assert.equal(f.app.tasks.list().find((t) => t.id === taskId)!.state, "SUCCEEDED");
+    assert.equal(f.orchestrator.recoverIfOrphaned(taskId), null);
+    assert.equal(f.app.tasks.list().find((t) => t.id === taskId)!.state, "SUCCEEDED");
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("recoverOrphans settles a CANCEL_REQUESTED task with a dead worker to CANCELLED", async () => {
+  const f = fixture();
+  try {
+    const taskId = await queuedTask(f);
+    // The worker crashed after requestCancel: queue entry consumed at claim,
+    // task CANCEL_REQUESTED, run still RUNNING, expired lease row left behind.
+    f.orchestrator.queue.dequeue(taskId);
+    f.app.repositories.tasks.update(taskId, { state: "CANCEL_REQUESTED" }, f.clock.now().toISOString());
+    const runId = (f.db.prepare(`SELECT id FROM workflow_runs WHERE task_revision_id IN (SELECT id FROM task_revisions WHERE task_id = ?)`).all(taskId) as { id: string }[])[0]!.id;
+    f.db.prepare("UPDATE workflow_runs SET state = 'RUNNING' WHERE id = ?").run(runId);
+    f.db.prepare("INSERT INTO worker_leases (lease_key, owner, task_id, acquired_at, expires_at) VALUES (?,?,?,?,?)")
+      .run(`task:${taskId}`, "dead-worker", taskId, f.clock.now().toISOString(), new Date(f.clock.now().getTime() - 1_000).toISOString());
+    const recovered = f.orchestrator.recoverOrphans();
+    assert.equal(recovered.length, 1);
+    assert.equal(f.app.tasks.list().find((t) => t.id === taskId)!.state, "CANCELLED", "user-requested cancel settles CANCELLED, not FAILED");
     assert.equal(f.app.workflows.status(runId).run.state, "CANCELLED");
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });

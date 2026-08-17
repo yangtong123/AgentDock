@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { resolve } from "node:path";
-import { openDatabase } from "../db/database.js";
+import { openDatabase, withImmediateTransaction } from "../db/database.js";
 import { createApplication } from "./application.js";
 import { expandPreset } from "../workflows/presets.js";
 import type { StepType } from "../shared/domain.js";
@@ -12,6 +12,7 @@ import { GhCliAdapter } from "../github/gh-cli-adapter.js";
 import { Orchestrator } from "../reliability/orchestrator.js";
 import { OutboxDispatcher } from "../reliability/outbox-dispatcher.js";
 import { TransactionalOutbox } from "../reliability/outbox.js";
+import { TaskQueue } from "../reliability/task-queue.js";
 
 function option(args:string[],name:string,required=true):string|undefined { const i=args.indexOf(`--${name}`); const value=i>=0?args[i+1]:undefined; if(required&&!value) throw new Error(`Missing --${name}`); return value; }
 function has(args:string[],name:string):boolean { return args.includes(`--${name}`); }
@@ -105,10 +106,65 @@ try {
   else if(resource==="task"&&action==="cleanup") console.log(JSON.stringify(await app.worktrees.cleanup(option(args,"task-id")!,{force:has(args,"force")}),null,2));
   else if(resource==="task"&&action==="status") console.log(JSON.stringify(await app.worktrees.status(option(args,"task-id")!),null,2));
   else if(resource==="task"&&action==="diff") console.log(await app.worktrees.diff(option(args,"task-id")!,{stat:has(args,"stat")}));
-  else if(resource==="workflow"&&action==="start") console.log(JSON.stringify(await app.workflows.start({taskId:option(args,"task-id")!,preset:option(args,"preset")!,providers:parseProviderOverrides(args)}),null,2));
-  else if(resource==="workflow"&&action==="execute") console.log(JSON.stringify(await app.workflows.execute(option(args,"run-id")!),null,2));
+  else if(resource==="workflow"&&action==="start") {
+    // Start + enqueue commit atomically: a running serve must never see a
+    // QUEUED run without its queue entry (it would be recovered as an orphan).
+    const started=withImmediateTransaction(db,()=>{
+      const s=app.workflows.start({taskId:option(args,"task-id")!,preset:option(args,"preset")!,providers:parseProviderOverrides(args)});
+      new TaskQueue(db).enqueue(option(args,"task-id")!);
+      return s;
+    });
+    console.log(JSON.stringify(started,null,2));
+  }
+  else if(resource==="workflow"&&action==="execute") {
+    // CLI execution joins the orchestrator protocol: scheduling gate (project
+    // ACTIVE), lease with heartbeats, active-run validation — so inline runs
+    // are neither reaped as orphans nor bypass the orchestrator's rules.
+    const runId=option(args,"run-id")!;
+    const row=db.prepare("SELECT tr.task_id AS taskId FROM workflow_runs wr JOIN task_revisions tr ON wr.task_revision_id = tr.id WHERE wr.id = ?").get(runId) as {taskId:string}|undefined;
+    const taskId=row?.taskId??null;
+    const orchestrator=new Orchestrator(db,app,app.processRunner,{});
+    const LEASE_TTL_MS=60_000;
+    const claim=taskId!==null?orchestrator.claimInlineRun(taskId,runId,`cli-${process.pid}`,LEASE_TTL_MS):null;
+    let leaseLost=false;
+    let lastRenewedAt=Date.now();
+    const heartbeat=claim!==null?setInterval(()=>{
+      if(leaseLost) return;
+      const state=claim.heartbeat();
+      if(state==="ok") { lastRenewedAt=Date.now(); return; }
+      // "lost" cancels immediately; "unknown" (transient DB error) only after a
+      // full TTL without a successful renewal — a single busy hiccup must not
+      // kill a healthy multi-hour run.
+      if(state==="lost"||Date.now()-lastRenewedAt>=LEASE_TTL_MS){ leaseLost=true; app.processRunner.cancelOwner(taskId!); }
+    },15_000):null;
+    try {
+      try {
+        console.log(JSON.stringify(await app.workflows.execute(runId),null,2));
+      } catch (error) {
+        // Surface the operator-meaningful cause, not the raw process error.
+        if(leaseLost) throw new Error(`Lease for task ${taskId} was lost mid-execution; the run was cancelled`);
+        throw error;
+      }
+      if(leaseLost) throw new Error(`Lease for task ${taskId} was lost mid-execution; the run was cancelled`);
+    } finally {
+      if(heartbeat!==null) clearInterval(heartbeat);
+      claim?.release();
+    }
+  }
   else if(resource==="workflow"&&action==="status") console.log(JSON.stringify(app.workflows.status(option(args,"run-id")!),null,2));
-  else if(resource==="workflow"&&action==="approve") console.log(JSON.stringify(app.workflows.approve(option(args,"run-id")!,!has(args,"reject")),null,2));
+  else if(resource==="workflow"&&action==="approve") {
+    // Approve + enqueue atomically, mirroring the IM approval path.
+    const runId=option(args,"run-id")!;
+    const approved=!has(args,"reject");
+    withImmediateTransaction(db,()=>{
+      app.workflows.approve(runId,approved);
+      if(approved) {
+        const row=db.prepare("SELECT tr.task_id AS taskId FROM workflow_runs wr JOIN task_revisions tr ON wr.task_revision_id = tr.id WHERE wr.id = ?").get(runId) as {taskId:string}|undefined;
+        if(row!==undefined) new TaskQueue(db).enqueue(row.taskId);
+      }
+    });
+    console.log(JSON.stringify(app.workflows.status(runId),null,2));
+  }
   else if(resource==="workflow"&&action==="cancel") console.log(JSON.stringify(app.workflows.cancel(option(args,"run-id")!),null,2));
   else if(resource==="github"&&action==="create-pr") {
     const github=new GitHubService(db,new GhCliAdapter(),app.repositories.tasks,app.repositories.projects);
@@ -124,8 +180,13 @@ try {
   }
   else if(resource==="github"&&action==="fix") {
     const github=new GitHubService(db,new GhCliAdapter(),app.repositories.tasks,app.repositories.projects);
-    const { runId, triggerCount }=await github.startFixWorkflow(option(args,"task-id")!,(input)=>app.workflows.start(input));
-    console.log(JSON.stringify({runId,triggerCount,queued:false,hint:"run: agentdock workflow execute --run-id "+runId},null,2));
+    const taskId=option(args,"task-id")!;
+    const { runId, triggerCount }=withImmediateTransaction(db,()=>{
+      const result=github.startFixWorkflow(taskId,(input)=>app.workflows.start(input));
+      new TaskQueue(db).enqueue(taskId);
+      return result;
+    });
+    console.log(JSON.stringify({runId,triggerCount,queued:true,hint:"a running serve will pick it up; or run: agentdock workflow execute --run-id "+runId},null,2));
   }
   else if(resource==="metrics"&&action==="summary") console.log(JSON.stringify({steps:app.metrics.stepMetrics(),tasks:app.metrics.taskMetrics()},null,2));
   else if(resource==="metrics"&&action==="usage") console.log(JSON.stringify(app.metrics.usageForTask(option(args,"task-id")!),null,2));

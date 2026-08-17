@@ -8,6 +8,7 @@ import { createApplication, type Application } from "../src/app/application.js";
 import { createRepository } from "./helpers.js";
 import { expandPreset } from "../src/workflows/presets.js";
 import { WorkflowEngine } from "../src/workflows/workflow-engine.js";
+import { ProcessCancelledError } from "../src/runtime/process-runner.js";
 import type { CodingAgent, AgentRunContext } from "../src/runtime/coding-agent.js";
 import { SqliteAgentThreadRepository } from "../src/agents/agent-thread-repository.js";
 import { SqliteArtifactRepository } from "../src/artifacts/artifact-repository.js";
@@ -83,8 +84,36 @@ test("fast preset runs IMPLEMENT then VERIFY and succeeds", async () => {
   } finally { h.db.close(); rmSync(h.base, { recursive: true, force: true }); }
 });
 
-test("verify failure fails the run and the task", async () => {
-  const h = harness();
+test("owner-scoped cancel kills a running VERIFY process", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agentdock-wf-"));
+  createRepository(join(base, "repo"));
+  const db = openDatabase(":memory:");
+  const app = createApplication(db);
+  const runner = new ProcessRunner();
+  try {
+    const taskRepo = new SqliteTaskRepository(db);
+    const runtime = new AgentThreadManager(new SqliteAgentThreadRepository(db), new SqliteArtifactRepository(db), taskRepo, (provider) => ({
+      provider,
+      async run() { return { exitCode: 0, stdout: "ok", stderr: "", externalSessionId: "s", resumed: false }; },
+    }), join(base, "artifacts"));
+    const engine = new WorkflowEngine(app.repositories.workflows, taskRepo, app.repositories.projects, runtime, new SqliteArtifactRepository(db), runner);
+    const project = app.projects.create({ name: "p-verify-cancel", repoPath: join(base, "repo"), worktreeRoot: join(base, "wt"), verifyCommand: [process.execPath, "-e", "setTimeout(() => {}, 60000)"] });
+    const { task } = app.tasks.create(project.id, "verify me");
+    await app.worktrees.prepare(task.id);
+    const started = engine.start({ taskId: task.id, preset: "fast" });
+    const execution = engine.execute(started.run.id);
+    for (let i = 0; i < 200; i++) {
+      if (engine.status(started.run.id).steps.find((s) => s.stepType === "VERIFY")?.state === "RUNNING") break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const startedAt = Date.now();
+    runner.cancelOwner(task.id);
+    await assert.rejects(execution, ProcessCancelledError, "cancelled VERIFY propagates as cancellation, not a plain failure");
+    assert.ok(Date.now() - startedAt < 10_000, "owner-scoped cancel must stop VERIFY promptly, not wait for its 60s runtime");
+  } finally { runner.cancelAll(); db.close(); rmSync(base, { recursive: true, force: true }); }
+});
+
+test("verify failure fails the run and the task", async () => {  const h = harness();
   try {
     const taskId = await readyTask(h, { verifyCommand: [process.execPath, "-e", "process.exit(1)"] });
     const started = await h.engine.start({ taskId, preset: "fast" });
@@ -171,7 +200,7 @@ test("workflows only start from READY tasks", async () => {
   try {
     const project = h.app.projects.create({ name: "p2", repoPath: join(h.base, "repo"), worktreeRoot: join(h.base, "wt") });
     const { task } = h.app.tasks.create(project.id, "draft task");
-    await assert.rejects(h.engine.start({ taskId: task.id, preset: "fast" }), /workflows start from READY/);
+    assert.throws(() => h.engine.start({ taskId: task.id, preset: "fast" }), /workflows start from READY/);
   } finally { h.db.close(); rmSync(h.base, { recursive: true, force: true }); }
 });
 

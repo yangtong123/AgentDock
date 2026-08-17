@@ -34,3 +34,27 @@ export function openDatabase(path: string, options: { migrate?: boolean } = {}):
   if (options.migrate !== false) migrate(db);
   return db;
 }
+
+/**
+ * Runs fn inside BEGIN IMMEDIATE/COMMIT, rolling back on error. Compound
+ * domain operations (e.g. approve + enqueue) must commit through one such
+ * transaction: recovery and lease acquisition in other processes classify
+ * from durable state and must never observe half of the operation.
+ *
+ * fn must be synchronous. Awaiting inside fn would yield the event loop
+ * while the write transaction is open, and any same-connection re-entry
+ * (another BEGIN IMMEDIATE from a queued continuation) throws "cannot start
+ * a transaction within a transaction". This is why WorkflowEngine.start /
+ * approve / GitHubService.startFixWorkflow have synchronous signatures.
+ */
+export function withImmediateTransaction<T>(db: Database, fn: () => T): T {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}

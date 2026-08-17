@@ -80,11 +80,23 @@ export class ProcessRunner {
       // Signal the process group (-pid); fall back to the child alone if it never became a leader.
       try { process.kill(-child.pid, "SIGTERM"); } catch { child.kill("SIGTERM"); }
     };
+    const forceKillTree = (): void => {
+      if (process.platform === "win32") { if (child.pid !== undefined) spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]); }
+      else if (child.pid !== undefined) { try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } }
+    };
 
+    // A cancelled process gets 5s of SIGTERM grace, then SIGKILL — independent
+    // of the (possibly much longer) step timeout. A cancelled agent must never
+    // keep writing to the worktree after its owner gave it up.
+    let cancelEscalation: NodeJS.Timeout | null = null;
     this.running.set(handle, { owner: options.owner, entry: {
       cancel: (reason) => {
         if (reason === "timeout") timedOut = true; else cancelled = true;
         killTree();
+        if (reason === "cancel") {
+          if (cancelEscalation) clearTimeout(cancelEscalation);
+          cancelEscalation = setTimeout(() => { if (this.running.has(handle)) forceKillTree(); }, 5_000);
+        }
       },
     } });
 
@@ -98,11 +110,12 @@ export class ProcessRunner {
 
     const timer = options.timeoutMs > 0 ? setTimeout(() => this.running.get(handle)?.entry.cancel("timeout"), options.timeoutMs) : null;
     // SIGTERM escalation: a child that ignores SIGTERM must not outlive the run forever.
-    const killTimer = options.timeoutMs > 0 ? setTimeout(() => { if (this.running.has(handle)) { if (process.platform === "win32") { if (child.pid !== undefined) spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"]); } else if (child.pid !== undefined) { try { process.kill(-child.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); } } } }, options.timeoutMs + 5_000) : null;
+    const killTimer = options.timeoutMs > 0 ? setTimeout(() => { if (this.running.has(handle)) forceKillTree(); }, options.timeoutMs + 5_000) : null;
 
     const result = await resultPromise;
     if (timer) clearTimeout(timer);
     if (killTimer) clearTimeout(killTimer);
+    if (cancelEscalation) clearTimeout(cancelEscalation);
     if (result.timedOut) throw new ProcessTimeoutError(result);
     if (result.cancelled) throw new ProcessCancelledError(result);
     return result;

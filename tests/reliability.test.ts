@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { openDatabase, type Database } from "../src/db/database.js";
+import { openDatabase, withImmediateTransaction, type Database } from "../src/db/database.js";
 import { CommandDedup, TransactionalOutbox, LeaseManager, type Clock } from "../src/reliability/outbox.js";
 import { TaskQueue } from "../src/reliability/task-queue.js";
 import { createApplication } from "../src/app/application.js";
@@ -15,6 +15,18 @@ function fakeClock(startMs: number): Clock & { advance(ms: number): void } {
 }
 
 function freshDb(): Database { return openDatabase(":memory:"); }
+
+test("withImmediateTransaction commits atomically and rejects nested re-entry on the same connection", () => {
+  const db = freshDb();
+  const queue = new TaskQueue(db);
+  assert.equal(withImmediateTransaction(db, () => { queue.enqueue("t1"); return "ok" }), "ok");
+  assert.equal(queue.size(), 1);
+  // A nested BEGIN IMMEDIATE on the same connection must fail and roll back
+  // the outer transaction body — never leave half of a compound operation.
+  assert.throws(() => withImmediateTransaction(db, () => { queue.enqueue("t2"); withImmediateTransaction(db, () => undefined); }), /transaction/);
+  assert.equal(queue.size(), 1, "outer body rolled back with the failed nested transaction");
+  db.close();
+});
 
 test("CommandDedup claims each key exactly once and prunes by age", () => {
   const clock = fakeClock(Date.UTC(2026, 0, 1));
@@ -70,6 +82,20 @@ test("LeaseManager: exclusive acquire, heartbeat renewal, expiry, release", () =
   assert.equal(leases.acquire("task:t1", "w2", "t1", 60_000), true, "expired lease becomes claimable");
   leases.release("task:t1", "w2");
   assert.equal(leases.expired("t1").length, 0);
+  db.close();
+});
+
+test("LeaseManager: heartbeat cannot revive an expired, taken-over, or released lease", () => {
+  const clock = fakeClock(Date.UTC(2026, 0, 1));
+  const db = freshDb();
+  const leases = new LeaseManager(db, clock);
+  assert.equal(leases.acquire("task:t1", "w1", "t1", 60_000), true);
+  clock.advance(120_000); // lease expired
+  assert.equal(leases.heartbeat("task:t1", "w1", 60_000), false, "expired lease stays dead");
+  assert.equal(leases.acquire("task:t1", "w2", "t1", 60_000), true, "another worker takes over the expired lease");
+  assert.equal(leases.heartbeat("task:t1", "w1", 60_000), false, "old owner cannot heartbeat the taken-over lease");
+  leases.release("task:t1", "w2");
+  assert.equal(leases.heartbeat("task:t1", "w2", 60_000), false, "released lease updates 0 rows");
   db.close();
 });
 

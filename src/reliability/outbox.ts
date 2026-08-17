@@ -131,13 +131,14 @@ export class LeaseManager {
     }
   }
 
-  /** Heartbeat = acquire with the same owner; false means the lease was lost. */
+  /** Heartbeat = conditional renewal: only a still-live lease owned by this
+   *  worker can be extended. An expired lease is dead — reviving it would
+   *  double-own the task after another worker took it over. */
   heartbeat(leaseKey: string, owner: string, ttlMs: number): boolean {
     const now = this.clock.now();
-    const existing = this.db.prepare("SELECT owner, expires_at FROM worker_leases WHERE lease_key = ?").get(leaseKey) as { owner: string; expires_at: string } | undefined;
-    if (!existing || existing.owner !== owner) return false;
-    this.db.prepare("UPDATE worker_leases SET expires_at = ? WHERE lease_key = ? AND owner = ?").run(new Date(now.getTime() + ttlMs).toISOString(), leaseKey, owner);
-    return true;
+    const result = this.db.prepare("UPDATE worker_leases SET expires_at = ? WHERE lease_key = ? AND owner = ? AND expires_at > ?")
+      .run(new Date(now.getTime() + ttlMs).toISOString(), leaseKey, owner, now.toISOString());
+    return result.changes === 1;
   }
 
   release(leaseKey: string, owner: string): void {

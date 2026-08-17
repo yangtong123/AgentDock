@@ -1,4 +1,5 @@
 import type { Database } from "../db/database.js";
+import { withImmediateTransaction } from "../db/database.js";
 import type { Application } from "../app/application.js";
 import type { ImAdapter, ImCommand, ImReply } from "./im-adapter.js";
 import { parseCommand } from "./command-parser.js";
@@ -136,13 +137,19 @@ export class ImController {
           if (!projectId) return respond("Select a project first with /use NAME.");
           try {
             await this.app.worktrees.prepare(command.taskId);
-            const started = await this.app.workflows.start({ taskId: command.taskId, preset: command.preset });
             if (this.orchestrator !== null) {
               // Production path: the orchestrator executes under lease/concurrency and notifies via outbox.
-              this.trackTaskInterest(command.conversationId, command.taskId, this.originAdapterOf(command.conversationId) ?? null);
-              this.orchestrator.queue.enqueue(command.taskId);
+              // Start + subscribe + enqueue commit as one operation: recovery
+              // must never see a QUEUED run without its queue entry.
+              const started = withImmediateTransaction(this.db, () => {
+                const s = this.app.workflows.start({ taskId: command.taskId, preset: command.preset });
+                this.trackTaskInterest(command.conversationId, command.taskId, this.originAdapterOf(command.conversationId) ?? null);
+                this.orchestrator!.queue.enqueue(command.taskId);
+                return s;
+              });
               return respond(`Run ${started.run.id} queued.`);
             }
+            const started = this.app.workflows.start({ taskId: command.taskId, preset: command.preset });
             const status = await this.app.workflows.execute(started.run.id);
             return respond(status.awaitingApproval
               ? `Run ${started.run.id} paused for your approval.`
@@ -183,10 +190,22 @@ export class ImController {
           return respond(`Task ${command.taskId} is ${task.state}; nothing to stop.`);
         }
         case "APPROVE_RUN": {
-          this.app.workflows.approve(command.runId, command.approved);
-          if (!command.approved) return respond("Rejected. The workflow is cancelled.");
-          // Resumed execution goes through the orchestrator like any other run:
-          // lease, concurrency gates, task timeout, and crash recovery all apply.
+          if (!command.approved) {
+            this.app.workflows.approve(command.runId, false);
+            return respond("Rejected. The workflow is cancelled.");
+          }
+          if (this.orchestrator !== null) {
+            // Approve + re-enqueue commit as one operation: orphan recovery
+            // must never observe the approved run without its queue entry.
+            // Resumed execution goes through the orchestrator like any other
+            // run: lease, concurrency gates, task timeout, crash recovery.
+            const message = withImmediateTransaction(this.db, () => {
+              this.app.workflows.approve(command.runId, true);
+              return this.enqueueResume(command.runId, command.conversationId);
+            });
+            return respond(message);
+          }
+          this.app.workflows.approve(command.runId, true);
           return respond(this.resumeRun(command.runId, command.conversationId));
         }
         case "CONTINUE_RUN": {
@@ -213,14 +232,24 @@ export class ImController {
     return null;
   }
 
+  /**
+   * Enqueues a paused run for the attached orchestrator. Callers that also
+   * mutate run/task state (e.g. approving a gate) must wrap both in one
+   * withImmediateTransaction: recovery classifies from durable state and must
+   * never observe the transition without its queue entry.
+   */
+  private enqueueResume(runId: string, conversationId?: string): string {
+    const taskId = this.taskIdForRun(runId);
+    if (taskId === null) return `Run ${runId} resumed.`;
+    if (conversationId !== undefined) this.trackTaskInterest(conversationId, taskId, this.originAdapterOf(conversationId) ?? null);
+    this.orchestrator!.queue.enqueue(taskId);
+    return `Run ${runId} resumed: queued for the orchestrator.`;
+  }
+
   /** Resumes an approved/paused run: enqueued under the orchestrator when attached. */
   private resumeRun(runId: string, conversationId?: string): string {
     const taskId = this.taskIdForRun(runId);
-    if (taskId !== null && this.orchestrator !== null) {
-      if (conversationId !== undefined) this.trackTaskInterest(conversationId, taskId, this.originAdapterOf(conversationId) ?? null);
-      this.orchestrator.queue.enqueue(taskId);
-      return `Run ${runId} resumed: queued for the orchestrator.`;
-    }
+    if (taskId !== null && this.orchestrator !== null) return this.enqueueResume(runId, conversationId);
     if (taskId === null) return `Run ${runId} resumed.`;
     // No orchestrator (tests, CLI-driven usage): execute inline as before.
     void this.app.workflows.execute(runId).catch(() => undefined);

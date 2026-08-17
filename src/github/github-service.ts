@@ -168,7 +168,9 @@ export class GitHubService {
    * triggers, and returns the run to enqueue. Callers (orchestrator/CLI) own
    * execution; this service only reopens and starts.
    */
-  async startFixWorkflow(taskId: string, start: (input: { taskId: string; preset: string }) => Promise<{ run: { id: string } }>): Promise<{ runId: string; triggerCount: number }> {
+  // Synchronous by design: reopen + start + trigger binding are one DB write
+  // batch that callers commit atomically with the queue enqueue.
+  startFixWorkflow(taskId: string, start: (input: { taskId: string; preset: string }) => { run: { id: string } }): { runId: string; triggerCount: number } {
     const triggers = this.pendingFixTriggers(taskId);
     if (triggers.length === 0) throw new ValidationError(`Task ${taskId} has no pending fix triggers`);
     const task = this.tasks.findById(taskId);
@@ -180,7 +182,7 @@ export class GitHubService {
     this.tasks.update(taskId, { state: "READY" }, this.now());
     let run;
     try {
-      run = await start({ taskId, preset: "fix" });
+      run = start({ taskId, preset: "fix" });
     } catch (error) {
       const current = this.tasks.findById(taskId);
       if (current && current.state === "READY") this.tasks.update(taskId, { state: "FAILED" }, this.now());

@@ -7,7 +7,7 @@ import type { ProjectRepository } from "../projects/project-repository.js";
 import type { ArtifactRepository } from "../artifacts/artifact-repository.js";
 import type { AgentThreadManager } from "../runtime/agent-thread-manager.js";
 import { expandPreset, DEFAULT_PROVIDERS, type ProviderAssignment } from "./presets.js";
-import { ProcessRunner } from "../runtime/process-runner.js";
+import { ProcessRunner, ProcessCancelledError } from "../runtime/process-runner.js";
 import { agentEnvironment } from "../runtime/env-agents.js";
 import { parseReviewReport, renderFindings, DEFAULT_MAX_REVIEW_ROUNDS, validateMaxReviewRounds, DEFAULT_SESSION_POLICIES, type SessionPolicy, type ReviewFinding } from "./review-findings.js";
 
@@ -71,7 +71,10 @@ export class WorkflowEngine {
   private readonly baseEnv: NodeJS.ProcessEnv;
   private readonly now: () => string;
 
-  async start(input: StartWorkflowInput): Promise<WorkflowStatus> {
+  // Synchronous by design: the whole start is one DB write batch, so callers
+  // can commit it inside withImmediateTransaction together with a queue
+  // enqueue. Never add an await here.
+  start(input: StartWorkflowInput): WorkflowStatus {
     const task = this.tasks.findById(input.taskId);
     if (!task) throw new NotFoundError(`Task ${input.taskId} not found`);
     if (task.state !== "READY") throw new ValidationError(`Task ${input.taskId} is ${task.state}; workflows start from READY tasks`);
@@ -283,13 +286,23 @@ export class WorkflowEngine {
 
   private async verify(command: string[], task: Task, stepTimeoutMs: number): Promise<boolean> {
     if (!task.worktreePath) return false;
-    const result = await this.verifyRunner.run({
-      cwd: task.worktreePath,
-      argv: command,
-      env: agentEnvironment(this.baseEnv),
-      timeoutMs: stepTimeoutMs,
-    }).catch(() => null);
-    return result !== null && result.exitCode === 0;
+    try {
+      const result = await this.verifyRunner.run({
+        cwd: task.worktreePath,
+        argv: command,
+        env: agentEnvironment(this.baseEnv),
+        timeoutMs: stepTimeoutMs,
+        // Owner-scoped like agent processes: cancelOwner/timeout must be able to
+        // stop a long VERIFY, not just agent CLIs.
+        owner: task.id,
+      });
+      return result.exitCode === 0;
+    } catch (error) {
+      // Cancellation propagates like agent-step cancellation: mapping it to a
+      // plain failure would stamp FAILED over a CANCEL_REQUESTED task.
+      if (error instanceof ProcessCancelledError) throw error;
+      return false;
+    }
   }
 
   private promptFor(stepType: StepRun["stepType"], revision: TaskRevision, task: Task, openFindings: ReviewFinding[]): string {

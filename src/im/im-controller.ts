@@ -18,7 +18,7 @@ export class ImController {
   private readonly adapters = new Map<string, ImAdapter>();
   private readonly audit: AuditLog;
   private orchestrator: Orchestrator | null = null;
-  private notifier: { subscribe(conversationId: string, taskId: string): void } | null = null;
+  private notifier: { subscribe(conversationId: string, taskId: string, adapter: string | null): void } | null = null;
   private readonly conversationOrigins = new Map<string, string>();
 
   constructor(
@@ -33,9 +33,9 @@ export class ImController {
   attachOrchestrator(orchestrator: Orchestrator): void { this.orchestrator = orchestrator; }
 
   /** Outbox dispatcher: terminal run events notify the conversation that started them. */
-  attachNotifier(notifier: { subscribe(conversationId: string, taskId: string): void }): void { this.notifier = notifier; }
+  attachNotifier(notifier: { subscribe(conversationId: string, taskId: string, adapter: string | null): void }): void { this.notifier = notifier; }
 
-  private trackTaskInterest(conversationId: string, taskId: string): void { this.notifier?.subscribe(conversationId, taskId); }
+  private trackTaskInterest(conversationId: string, taskId: string, adapter: string | null): void { this.notifier?.subscribe(conversationId, taskId, adapter); }
 
   register(adapter: ImAdapter): void {
     adapter.onMessage(async (message) => {
@@ -46,19 +46,38 @@ export class ImController {
     this.adapters.set(adapter.name, adapter);
   }
 
-  /** Remembers which adapter a conversation came from (notifications route back through it). */
+  /** Conversation origin tracking row type: adapter = 'origin', project_id holds the adapter name. */
+  private static readonly ORIGIN_ADAPTER = "origin";
+
+  /** Remembers which adapter a conversation came from, durably (survives restarts). */
   private rememberConversationAdapter(conversationId: string, adapterName: string): void {
-    this.db.prepare(`INSERT INTO im_conversations (conversation_id, adapter, project_id, focused_task_id, updated_at) VALUES (?, 'origin', NULL, NULL, ?)
-      ON CONFLICT (conversation_id, adapter) DO NOTHING`).run(conversationId, this.now());
+    this.db.prepare(`INSERT INTO im_conversations (conversation_id, adapter, project_id, focused_task_id, updated_at)
+      VALUES (?, ?, ?, NULL, ?)
+      ON CONFLICT (conversation_id, adapter) DO UPDATE SET project_id = excluded.project_id, updated_at = excluded.updated_at`)
+      .run(conversationId, ImController.ORIGIN_ADAPTER, adapterName, this.now());
     this.conversationOrigins.set(conversationId, adapterName);
   }
 
+  /** Resolves the adapter a conversation belongs to: memory first, then the durable row. */
+  private originAdapterOf(conversationId: string): string | undefined {
+    const memory = this.conversationOrigins.get(conversationId);
+    if (memory !== undefined) return memory;
+    const row = this.db.prepare("SELECT project_id FROM im_conversations WHERE conversation_id = ? AND adapter = ?").get(conversationId, ImController.ORIGIN_ADAPTER) as { project_id: string | null } | undefined;
+    if (row?.project_id != null) {
+      this.conversationOrigins.set(conversationId, row.project_id);
+      return row.project_id;
+    }
+    return undefined;
+  }
+
   /** Outbox dispatcher entry point: push a notification to the conversation's adapter. */
-  async notify(conversationId: string, text: string): Promise<void> {
-    const origin = this.conversationOrigins.get(conversationId);
-    const adapter = origin !== undefined ? this.adapters.get(origin) : undefined;
+  async notify(conversationId: string, text: string, adapterHint: string | null = null): Promise<void> {
+    // The subscription's adapter hint wins: same conversationId on two
+    // platforms must never receive each other's notifications.
+    const origin = adapterHint ?? this.originAdapterOf(conversationId) ?? null;
+    const adapter = origin !== null ? this.adapters.get(origin) : undefined;
     if (adapter !== undefined) { await adapter.send({ conversationId, text }); return; }
-    // Unknown origin (pre-restart conversation): try every adapter; wrong-platform sends fail silently.
+    // Never seen this conversation: try every adapter; wrong-platform sends fail silently.
     for (const candidate of this.adapters.values()) await candidate.send({ conversationId, text }).catch(() => undefined);
   }
 
@@ -121,7 +140,7 @@ export class ImController {
             const started = await this.app.workflows.start({ taskId: command.taskId, preset: command.preset });
             if (this.orchestrator !== null) {
               // Production path: the orchestrator executes under lease/concurrency and notifies via outbox.
-              this.trackTaskInterest(command.conversationId, command.taskId);
+              this.trackTaskInterest(command.conversationId, command.taskId, this.originAdapterOf(command.conversationId) ?? null);
               this.orchestrator.queue.enqueue(command.taskId);
               return respond(`Run ${started.run.id} queued.`);
             }
@@ -199,7 +218,7 @@ export class ImController {
   private resumeRun(runId: string, conversationId?: string): string {
     const taskId = this.taskIdForRun(runId);
     if (taskId !== null && this.orchestrator !== null) {
-      if (conversationId !== undefined) this.trackTaskInterest(conversationId, taskId);
+      if (conversationId !== undefined) this.trackTaskInterest(conversationId, taskId, this.originAdapterOf(conversationId) ?? null);
       this.orchestrator.queue.enqueue(taskId);
       return `Run ${runId} resumed: queued for the orchestrator.`;
     }

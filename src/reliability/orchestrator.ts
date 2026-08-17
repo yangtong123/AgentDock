@@ -125,7 +125,9 @@ export class Orchestrator {
    */
   async runPendingFixes(): Promise<{ taskId: string; runId: string }[]> {
     const started: { taskId: string; runId: string }[] = [];
-    const rows = this.db.prepare(`SELECT DISTINCT task_id FROM github_fix_events`).all() as { task_id: string }[];
+    // Only tasks with unconsumed triggers are candidates; a bound-but-unfinished
+    // fix run is skipped by the activeRunId check below.
+    const rows = this.db.prepare(`SELECT DISTINCT task_id FROM github_fix_events WHERE consumed_by_run IS NULL`).all() as { task_id: string }[];
     for (const { task_id: taskId } of rows) {
       const task = this.app.repositories.tasks.findById(taskId);
       if (!task || task.state !== "FAILED") continue;
@@ -186,6 +188,10 @@ export class Orchestrator {
       if (activeRun === null) throw new Error(`Task ${taskId} has no run to execute`);
       const status = await this.app.workflows.execute(activeRun);
       this.outbox.publish({ taskId, workflowRunId: activeRun, type: `run.${status.run.state.toLowerCase()}`, payload: { taskId, runId: activeRun, state: status.run.state } });
+      // Fix-trigger lifecycle: a SUCCEEDED fix run consumed its CI/review
+      // feedback — clear it; a FAILED/CANCELLED run unbinds so the next sweep retries.
+      if (status.run.state === "SUCCEEDED") this.app.github.clearConsumedTriggers(activeRun);
+      else if (status.run.state === "FAILED" || status.run.state === "CANCELLED") this.db.prepare("UPDATE github_fix_events SET consumed_by_run = NULL WHERE consumed_by_run = ?").run(activeRun);
     } catch (error) {
       this.outbox.publish({ taskId, type: "run.worker-error", payload: { taskId, message: error instanceof Error ? error.message : String(error) } });
     } finally {

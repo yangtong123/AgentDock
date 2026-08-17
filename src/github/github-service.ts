@@ -121,9 +121,19 @@ export class GitHubService {
     return { newReviews: fresh.map(({ author, state, body }) => ({ author, state, body })), fixTriggered };
   }
 
-  /** Pending fix triggers for a task (CI failures, review feedback). */
+  /** Unconsumed fix triggers for a task (CI failures, review feedback). */
   pendingFixTriggers(taskId: string): { reason: string; detail: string }[] {
-    return this.db.prepare("SELECT reason, detail FROM github_fix_events WHERE task_id = ? ORDER BY created_at").all(taskId) as { reason: string; detail: string }[];
+    return this.db.prepare("SELECT reason, detail FROM github_fix_events WHERE task_id = ? AND consumed_by_run IS NULL ORDER BY created_at").all(taskId) as { reason: string; detail: string }[];
+  }
+
+  /** Marks all unconsumed triggers as consumed by a specific run. */
+  markTriggersConsumed(taskId: string, runId: string): void {
+    this.db.prepare("UPDATE github_fix_events SET consumed_by_run = ? WHERE task_id = ? AND consumed_by_run IS NULL").run(runId, taskId);
+  }
+
+  /** Clears triggers a run consumed — called when that fix run SUCCEEDED. */
+  clearConsumedTriggers(runId: string): void {
+    this.db.prepare("DELETE FROM github_fix_events WHERE consumed_by_run = ?").run(runId);
   }
 
   /**
@@ -176,6 +186,9 @@ export class GitHubService {
       if (current && current.state === "READY") this.tasks.update(taskId, { state: "FAILED" }, this.now());
       throw error;
     }
+    // Bind the triggers to this run: a successful run clears them; a failed run
+    // unbinds them so the next sweep retries with the same feedback.
+    this.markTriggersConsumed(taskId, run.run.id);
     return { runId: run.run.id, triggerCount: triggers.length };
   }
 

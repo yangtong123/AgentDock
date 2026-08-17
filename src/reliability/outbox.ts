@@ -77,10 +77,15 @@ export class TransactionalOutbox {
     }
   }
 
-  /** Marks an event delivered by its claimer. No-ops when another worker re-claimed it. */
-  markProcessed(eventId: number, worker: string): void {
-    this.db.prepare("UPDATE outbox_events SET processed_at = ?, processed_by = ? WHERE id = ? AND (claim_expires_at IS NULL OR processed_by = ?)")
+  /**
+   * Marks an event delivered by its claimer. Only the current claim holder can
+   * close an event: processed_by must match and the event must still be open.
+   * A worker whose claim expired and was re-claimed elsewhere is refused.
+   */
+  markProcessed(eventId: number, worker: string): boolean {
+    const result = this.db.prepare("UPDATE outbox_events SET processed_at = ?, processed_by = ? WHERE id = ? AND processed_at IS NULL AND processed_by = ?")
       .run(this.now(), worker, eventId, worker);
+    return result.changes === 1;
   }
 
   /** Releases a claim without marking processed (retryable immediately). */

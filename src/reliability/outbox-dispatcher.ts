@@ -28,23 +28,30 @@ export class OutboxDispatcher {
   constructor(
     private readonly db: Database,
     private readonly outbox: TransactionalOutbox,
-    private readonly send: (conversationId: string, text: string) => Promise<void>,
+    private readonly send: (conversationId: string, text: string, adapter: string | null) => Promise<void>,
     private readonly workerId: string,
     private readonly pollMs = 2_000,
     private readonly now = () => new Date().toISOString(),
   ) {}
 
-  /** Records which conversation to notify about a task. */
-  subscribe(conversationId: string, taskId: string): void {
+  private static readonly SUB_ADAPTER = "subscription";
+
+  /**
+   * Records which conversation to notify about a task. Subscriptions are
+   * scoped to (conversation, adapter): two platforms using the same
+   * conversation id never receive each other's notifications.
+   */
+  subscribe(conversationId: string, taskId: string, adapter: string | null): void {
     this.db.prepare(`INSERT INTO im_conversations (conversation_id, adapter, project_id, focused_task_id, updated_at)
-      VALUES (?, 'dispatcher', NULL, ?, ?)
+      VALUES (?, ?, ?, ?, ?)
       ON CONFLICT (conversation_id, adapter) DO UPDATE SET focused_task_id = excluded.focused_task_id, updated_at = excluded.updated_at`)
-      .run(conversationId, taskId, this.now());
+      .run(conversationId, OutboxDispatcher.SUB_ADAPTER, adapter, taskId, this.now());
   }
 
-  private subscribersFor(taskId: string | null): string[] {
+  private subscribersFor(taskId: string | null): { conversationId: string; adapter: string | null }[] {
     if (taskId === null) return [];
-    return (this.db.prepare("SELECT conversation_id FROM im_conversations WHERE focused_task_id = ?").all(taskId) as { conversation_id: string }[]).map((row) => row.conversation_id);
+    return (this.db.prepare("SELECT conversation_id, project_id FROM im_conversations WHERE adapter = ? AND focused_task_id = ?").all(OutboxDispatcher.SUB_ADAPTER, taskId) as { conversation_id: string; project_id: string | null }[])
+      .map((row) => ({ conversationId: row.conversation_id, adapter: row.project_id }));
   }
 
   async start(): Promise<void> {
@@ -72,8 +79,8 @@ export class OutboxDispatcher {
       try {
         const text = describeEvent(event);
         if (text !== null) {
-          for (const conversationId of this.subscribersFor(event.taskId)) {
-            await this.send(conversationId, text);
+          for (const subscriber of this.subscribersFor(event.taskId)) {
+            await this.send(subscriber.conversationId, text, subscriber.adapter);
           }
         }
         this.outbox.markProcessed(event.id, this.workerId);

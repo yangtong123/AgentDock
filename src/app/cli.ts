@@ -73,7 +73,7 @@ try {
     const orchestrator=new Orchestrator(db,app,app.processRunner,{});
     controller.attachOrchestrator(orchestrator);
     // Outbox delivery: terminal run events notify the IM conversation that started the task.
-    const dispatcher=new OutboxDispatcher(db,new TransactionalOutbox(db),(conversationId,text)=>controller.notify(conversationId,text),"serve-dispatcher");
+    const dispatcher=new OutboxDispatcher(db,new TransactionalOutbox(db),(conversationId,text,adapter)=>controller.notify(conversationId,text,adapter),"serve-dispatcher");
     controller.attachNotifier(dispatcher);
     await controller.startAll();
     await orchestrator.start();

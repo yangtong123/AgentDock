@@ -85,16 +85,26 @@ ${writeRules}
     const home = process.env.HOME ?? "/home/unknown";
     const args = [
       "bwrap",
+      // Runtime filesystem: dynamic linkers live in /lib,/lib64 (often symlinks
+      // into /usr, but not always); /etc carries CA certs, DNS, passwd, nsswitch.
+      // Without these, node/git/claude/codex die on the first exec or TLS call.
       "--ro-bind", "/usr", "/usr",
+      "--ro-bind-try", "/lib", "/lib",
+      "--ro-bind-try", "/lib64", "/lib64",
+      "--ro-bind-try", "/bin", "/bin",
+      "--ro-bind-try", "/sbin", "/sbin",
+      "--ro-bind", "/etc", "/etc",
       "--proc", "/proc",
       "--dev", "/dev",
       "--tmpfs", "/tmp",
       "--bind", worktreePath, worktreePath,
-      "--ro-bind", `${home}/.claude`, `${home}/.claude`,
-      "--ro-bind", `${home}/.codex`, `${home}/.codex`,
+      // Config dirs only when they exist: --ro-bind fails hard on missing paths.
+      "--ro-bind-try", `${home}/.claude`, `${home}/.claude`,
+      "--ro-bind-try", `${home}/.codex`, `${home}/.codex`,
+      "--ro-bind-try", `${home}/.config`, `${home}/.config`,
       "--setenv", "HOME", home,
     ];
-    for (const path of profile.extraReadPaths ?? []) args.push("--ro-bind", path, path);
+    for (const path of profile.extraReadPaths ?? []) args.push("--ro-bind-try", path, path);
     // Network stays up: --unshare-net would also kill the agent's model-API traffic.
     args.push("--", ...argv);
     return args;

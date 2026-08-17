@@ -17,7 +17,7 @@ function usage():never { console.error(`AgentDock V1.0
 Usage:
   agentdock serve (long-running: Telegram adapter when TELEGRAM_BOT_TOKEN is set)
   agentdock migrate
-  agentdock project add --name NAME --repo-path PATH --worktree-root PATH [--base-branch main] [--max-concurrent-tasks 1] [--verify-command JSON_ARGV]
+  agentdock project add --name NAME --repo-path PATH --worktree-root PATH [--base-branch main] [--max-concurrent-tasks 1] [--verify-command JSON_ARGV] [--permission-profile default|restricted|sandboxed|full-access]
   agentdock project list
   agentdock project validate --project-id ID
   agentdock project set-status --project-id ID --status ACTIVE|PAUSED|DISABLED
@@ -83,7 +83,9 @@ try {
     const baseBranch=option(args,"base-branch",false);
     const verifyCommandRaw=option(args,"verify-command",false);
     const verifyCommand=verifyCommandRaw===undefined?undefined:JSON.parse(verifyCommandRaw) as string[];
-    console.log(JSON.stringify(app.projects.create({name:option(args,"name")!,repoPath:option(args,"repo-path")!,worktreeRoot:option(args,"worktree-root")!,...(baseBranch === undefined ? {} : {baseBranch}),maxConcurrentTasks:Number(option(args,"max-concurrent-tasks",false)??1),...(verifyCommand===undefined?{}:{verifyCommand})}),null,2));
+    const permissionProfile=option(args,"permission-profile",false);
+    if(permissionProfile!==undefined&&!["default","restricted","sandboxed","full-access"].includes(permissionProfile)) throw new Error("permission-profile must be default, restricted, sandboxed, or full-access");
+    console.log(JSON.stringify(app.projects.create({name:option(args,"name")!,repoPath:option(args,"repo-path")!,worktreeRoot:option(args,"worktree-root")!,...(baseBranch === undefined ? {} : {baseBranch}),maxConcurrentTasks:Number(option(args,"max-concurrent-tasks",false)??1),...(verifyCommand===undefined?{}:{verifyCommand}),...(permissionProfile===undefined?{}:{permissionProfile})}),null,2));
   }
   else if(resource==="project"&&action==="list") console.log(JSON.stringify(app.projects.list(),null,2));
   else if(resource==="project"&&action==="set-status") console.log(JSON.stringify(app.projects.setStatus(option(args,"project-id")!,option(args,"status")!),null,2));

@@ -1,6 +1,7 @@
 import type { CodingAgent, AgentRunContext, AgentRunOutcome } from "./coding-agent.js";
 import type { ProcessRunner } from "./process-runner.js";
 import { SecretIsolation } from "../security/permissions.js";
+import { OsSandbox } from "./os-sandbox.js";
 
 /**
  * Environment policy: coding agents run with a controlled environment rather
@@ -15,6 +16,30 @@ export function agentEnvironment(base: NodeJS.ProcessEnv, extra: Record<string, 
   return SecretIsolation.sanitize({ ...env, ...extra });
 }
 
+/** Claude Code's own tool policing (layer 1). acceptEdits auto-approves file
+ *  edits inside the worktree; the explicit allowlist keeps Bash to read-only
+ *  inspection and git. Web tools are denied outright. */
+function claudePermissionArgs(profile: AgentRunContext["profile"]): string[] {
+  if (profile.providerMode === "full-access") return ["--dangerously-skip-permissions"];
+  return [
+    "--permission-mode", "acceptEdits",
+    "--allowedTools", "Read", "Glob", "Grep", "Edit", "Write", "NotebookEdit", "Bash(git *)", "Bash(ls *)", "Bash(node *)", "Bash(npm run *)", "Bash(npm test*)", "Bash(npx tsc*)",
+    "--disallowedTools", "WebFetch", "WebSearch",
+  ];
+}
+
+/**
+ * Codex's own sandbox (layer 1): workspace-write confines writes to the
+ * worktree. network_access must stay true — it gates the Codex process's own
+ * API traffic too, so false breaks the model call entirely; agent-child
+ * network denial is enforced by the OS sandbox (layer 2) instead.
+ */
+function codexSandboxArgs(profile: AgentRunContext["profile"]): string[] {
+  if (profile.providerMode === "full-access") return ["--dangerously-bypass-approvals-and-sandbox"];
+  // exec mode is non-interactive: with -s workspace-write, approvals are auto-handled within the sandbox.
+  return ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"];
+}
+
 export interface EnvCodingAgentOptions {
   provider: string;
   binary: string;
@@ -22,6 +47,8 @@ export interface EnvCodingAgentOptions {
   argv: (context: AgentRunContext) => string[];
   /** Extracts the durable session id from the raw CLI output, if the CLI emits one. */
   parseSessionId: (stdout: string, stderr: string) => string | null;
+  /** Deliver the prompt via stdin instead of a positional argument. */
+  promptViaStdin?: boolean;
 }
 
 /** Shared argv/parse plumbing for CLI coding agents whose resume is session-id based. */
@@ -34,17 +61,22 @@ export class EnvCodingAgent implements CodingAgent {
   get provider(): string { return this.options.provider; }
 
   async run(context: AgentRunContext): Promise<AgentRunOutcome> {
-    const result = await this.runner.run({
-      cwd: context.worktreePath,
-      argv: this.options.argv(context),
-      env: context.env,
-      timeoutMs: context.timeoutMs,
-      owner: context.taskId,
-    });
+    // Layer 1: provider-native permission/sandbox flags. Layer 2: OS sandbox wraps the whole argv.
+    // The prompt goes through stdin when promptViaStdin is set: variadic flags
+    // like --allowedTools would otherwise swallow a positional prompt argument.
+    const nativeArgv = this.options.argv(context);
+    const plan = OsSandbox.plan(context.profile, context.worktreePath, nativeArgv);
+    const runArgs = { cwd: context.worktreePath, argv: plan.argv, env: context.env, timeoutMs: context.timeoutMs, owner: context.taskId } as const;
+    const result = await this.runner.run(this.options.promptViaStdin === true ? { ...runArgs, stdin: context.prompt } : runArgs);
+    return this.toOutcome(result, context, plan.fallbackReason);
+  }
+
+  private toOutcome(result: { exitCode: number | null; stdout: string; stderr: string; timedOut: boolean; cancelled: boolean }, context: AgentRunContext, fallbackReason: string | null): AgentRunOutcome {
     return {
       exitCode: result.exitCode,
       stdout: result.stdout,
-      stderr: result.stderr,
+      // Enforcement skipped is surfaced, never silent.
+      stderr: fallbackReason !== null ? `${result.stderr}\n[agentdock] OS sandbox skipped: ${fallbackReason}` : result.stderr,
       externalSessionId: this.options.parseSessionId(result.stdout, result.stderr),
       resumed: context.resumeSessionId !== null,
     };
@@ -57,11 +89,13 @@ export class ClaudeAgent extends EnvCodingAgent {
     super(runner, {
       provider: "claude",
       binary,
+      // The prompt travels via stdin: variadic tool flags (--allowedTools ...)
+      // consume any positional argument that follows them.
+      promptViaStdin: true,
       argv: (context) => [
         binary, "-p", "--output-format", "json",
         ...(context.resumeSessionId ? ["--resume", context.resumeSessionId] : []),
-        "--dangerously-skip-permissions",
-        context.prompt,
+        ...claudePermissionArgs(context.profile),
       ],
       parseSessionId: (stdout) => { try { return JSON.parse(stdout).session_id ?? null; } catch { return null; } },
     });
@@ -75,7 +109,7 @@ export class CodexAgent extends EnvCodingAgent {
       provider: "codex",
       binary,
       argv: (context) => {
-        const base = [binary, "exec", "--skip-git-repo-check", "--dangerously-bypass-approvals-and-sandbox"];
+        const base = [binary, "exec", "--skip-git-repo-check", ...codexSandboxArgs(context.profile)];
         return context.resumeSessionId
           ? [...base, "resume", context.resumeSessionId, context.prompt]
           : [...base, context.prompt];

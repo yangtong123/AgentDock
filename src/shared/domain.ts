@@ -15,6 +15,8 @@ export interface Project {
   status: ProjectStatus; maxConcurrentTasks: number; defaultWorkflowPreset: string | null;
   /** Deterministic verification command, stored as a JSON argv array. */
   verifyCommand: string[] | null;
+  /** Permission profile name controlling agent sandboxing (default/restricted/sandboxed). */
+  permissionProfile: string | null;
   createdAt: string; updatedAt: string;
 }
 export interface Task {

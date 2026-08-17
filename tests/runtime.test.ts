@@ -7,6 +7,7 @@ import { openDatabase } from "../src/db/database.js";
 import { createApplication } from "../src/app/application.js";
 import { ProcessRunner, ProcessTimeoutError, ProcessCancelledError } from "../src/runtime/process-runner.js";
 import { EnvCodingAgent, agentEnvironment, ClaudeAgent, CodexAgent } from "../src/runtime/env-agents.js";
+import { PROFILES } from "../src/security/permissions.js";
 import type { CodingAgent, AgentRunContext, AgentRunOutcome } from "../src/runtime/coding-agent.js";
 import { AgentThreadManager } from "../src/runtime/agent-thread-manager.js";
 import { SqliteAgentThreadRepository } from "../src/agents/agent-thread-repository.js";
@@ -219,37 +220,44 @@ test("AgentThreadManager passes a sanitized environment to the agent", async () 
   } finally { db.close(); rmSync(base, { recursive: true, force: true }); }
 });
 
-function spyRunner(overrides: { stdout?: string } = {}): { runner: ProcessRunner; argv: () => string[] } {
+function spyRunner(overrides: { stdout?: string } = {}): { runner: ProcessRunner; argv: () => string[]; stdin: () => string | undefined } {
   let lastArgv: string[] = [];
+  let lastStdin: string | undefined;
   const runner = {
-    run: async (options: { argv: string[] }) => {
+    run: async (options: { argv: string[]; stdin?: string }) => {
       lastArgv = options.argv;
+      lastStdin = options.stdin;
       return { stdout: overrides.stdout ?? "", stderr: "", exitCode: 0, signal: null, timedOut: false, cancelled: false };
     },
   } as unknown as ProcessRunner;
-  return { runner, argv: () => lastArgv };
+  return { runner, argv: () => lastArgv, stdin: () => lastStdin };
 }
 
 test("ClaudeAgent and CodexAgent build correct argv with and without resume", async () => {
-  const { runner, argv } = spyRunner();
+  const { runner, argv, stdin } = spyRunner();
+  // full-access skips the OS wrapper so raw provider argv is observable.
+  const raw = PROFILES["full-access"]!;
   const claude = new ClaudeAgent(runner);
-  await claude.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "do", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
+  await claude.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", profile: raw, prompt: "do", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.deepEqual(argv().slice(0, 4), ["claude", "-p", "--output-format", "json"]);
-  assert.equal(argv().includes("do"), true);
-  await claude.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "more", resumeSessionId: "s1", revisionRequest: "r", timeoutMs: 1000, env: {} });
+  assert.equal(stdin(), "do", "claude prompt travels via stdin, out of variadic-flag reach");
+  assert.equal(argv().includes("do"), false);
+  await claude.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", profile: raw, prompt: "more", resumeSessionId: "s1", revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.deepEqual(argv().slice(4, 6), ["--resume", "s1"]);
   const codex = new CodexAgent(runner);
-  await codex.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "do", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
+  await codex.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", profile: raw, prompt: "do", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.deepEqual(argv().slice(0, 3), ["codex", "exec", "--skip-git-repo-check"]);
-  await codex.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "do", resumeSessionId: "s2", revisionRequest: "r", timeoutMs: 1000, env: {} });
-  assert.deepEqual(argv().slice(4, 6), ["resume", "s2"]);
+  await codex.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", profile: raw, prompt: "do", resumeSessionId: "s2", revisionRequest: "r", timeoutMs: 1000, env: {} });
+  const codexArgs = argv();
+  const resumeIndex = codexArgs.indexOf("resume");
+  assert.deepEqual(codexArgs.slice(resumeIndex, resumeIndex + 2), ["resume", "s2"]);
 });
 
 test("CodexAgent parses session ids from both plain and JSON output", async () => {
   const plain = spyRunner({ stdout: `session id: 12345678-1234-1234-1234-123456789012\nwork work\n` });
-  const plainOutcome = await new CodexAgent(plain.runner).run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
+  const plainOutcome = await new CodexAgent(plain.runner).run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", profile: PROFILES["default"]!, prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.equal(plainOutcome.externalSessionId, "12345678-1234-1234-1234-123456789012");
   const json = spyRunner({ stdout: `{"session_id":"abcdefab-cdef-abcd-efab-cdefabcdefab","type":"message"}\n` });
-  const jsonOutcome = await new CodexAgent(json.runner).run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
+  const jsonOutcome = await new CodexAgent(json.runner).run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", profile: PROFILES["default"]!, prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.equal(jsonOutcome.externalSessionId, "abcdefab-cdef-abcd-efab-cdefabcdefab");
 });

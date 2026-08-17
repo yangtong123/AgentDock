@@ -251,9 +251,10 @@ export class WorkflowEngine {
     const policy: SessionPolicy = DEFAULT_SESSION_POLICIES[step.stepType] ?? "FRESH";
     const resumeThreadId = policy === "RESUME" ? threads.get(step.stepType) : undefined;
     const prompt = this.promptFor(step.stepType, revision, task, openFindings);
+    const project = this.projects.findById(task.projectId);
     const startedAt = this.now();
     const execution = await this.runtime.run(
-      { taskId: task.id, role: step.stepType, prompt, revisionRequest: revision.request, timeoutMs: stepTimeoutMs },
+      { taskId: task.id, role: step.stepType, prompt, revisionRequest: revision.request, timeoutMs: stepTimeoutMs, permissionProfile: project?.permissionProfile ?? null },
       step.provider ?? "claude",
       resumeThreadId === undefined ? {} : { resumeThreadId },
     );

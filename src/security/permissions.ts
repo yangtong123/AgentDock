@@ -1,5 +1,8 @@
 import type { Database } from "../db/database.js";
 
+/** How the OS-level sandbox (layer 2) is applied. */
+export type OsSandboxMode = "none" | "macos-seatbelt" | "linux-bwrap";
+
 /** Named permission profile controlling what coding agents may do. */
 export interface PermissionProfile {
   name: string;
@@ -7,17 +10,38 @@ export interface PermissionProfile {
   envAllow: string[];
   /** Maximum wall-clock ms per agent step. */
   stepTimeoutMs: number;
-  /** Whether agents may access the network at all (informational for CLI agents, enforced in env: no proxy vars). */
+  /** Whether agents may access the network. Enforced by the OS sandbox and provider-native modes. */
   networkAccess: boolean;
-  /** Extra directories agents may read (informational). */
+  /** Extra directories agents may read beyond defaults (informational for provider-native, enforced by OS sandbox). */
   extraReadPaths: string[];
+  /**
+   * Provider-native permission mode (layer 1): the agent CLI polices its own
+   * tools. "provider-sandboxed" maps to codex -s workspace-write and
+   * claude --permission-mode acceptEdits + a conservative tool allowlist.
+   * "full-access" keeps the old dangerous flags for projects that opt in.
+   */
+  providerMode: "provider-sandboxed" | "full-access";
+  /** OS-level enforcement (layer 2): sandbox-exec on macOS, bwrap on Linux, none to disable. */
+  osSandbox: OsSandboxMode;
 }
 
 export const PROFILES: Record<string, PermissionProfile> = {
-  default: { name: "default", envAllow: [], stepTimeoutMs: 30 * 60 * 1000, networkAccess: true, extraReadPaths: [] },
-  restricted: { name: "restricted", envAllow: [], stepTimeoutMs: 15 * 60 * 1000, networkAccess: false, extraReadPaths: [] },
-  sandboxed: { name: "sandboxed", envAllow: [], stepTimeoutMs: 10 * 60 * 1000, networkAccess: false, extraReadPaths: [] },
+  // default: provider-native tool policing + OS write-jail. Network stays up
+  // at the OS layer (model API needs it); agent children are confined by the
+  // provider sandbox.
+  default: { name: "default", envAllow: [], stepTimeoutMs: 30 * 60 * 1000, networkAccess: true, extraReadPaths: [], providerMode: "provider-sandboxed", osSandbox: "macos-seatbelt" },
+  restricted: { name: "restricted", envAllow: [], stepTimeoutMs: 15 * 60 * 1000, networkAccess: false, extraReadPaths: [], providerMode: "provider-sandboxed", osSandbox: "macos-seatbelt" },
+  sandboxed: { name: "sandboxed", envAllow: [], stepTimeoutMs: 10 * 60 * 1000, networkAccess: false, extraReadPaths: [], providerMode: "provider-sandboxed", osSandbox: "macos-seatbelt" },
+  // Legacy behavior for projects that manage isolation externally.
+  "full-access": { name: "full-access", envAllow: [], stepTimeoutMs: 30 * 60 * 1000, networkAccess: true, extraReadPaths: [], providerMode: "full-access", osSandbox: "none" },
 };
+
+export function resolveProfile(name: string | null | undefined): PermissionProfile {
+  if (name === null || name === undefined) return PROFILES["default"]!;
+  const profile = PROFILES[name];
+  if (profile === undefined) throw new Error(`Unknown permission profile: ${name} (expected ${Object.keys(PROFILES).join(", ")})`);
+  return profile;
+}
 
 /**
  * Secret isolation: strips credential-shaped variables before they reach a

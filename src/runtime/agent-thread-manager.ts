@@ -9,6 +9,7 @@ import type { CodingAgent, AgentRunOutcome } from "./coding-agent.js";
 import { NotFoundError, ValidationError } from "../shared/domain.js";
 import { ProcessTimeoutError, ProcessCancelledError } from "./process-runner.js";
 import { agentEnvironment } from "./env-agents.js";
+import { resolveProfile, type PermissionProfile } from "../security/permissions.js";
 
 export interface StartThreadInput {
   taskId: string;
@@ -16,6 +17,8 @@ export interface StartThreadInput {
   prompt: string;
   revisionRequest: string;
   timeoutMs: number;
+  /** Project's permission profile name; defaults to "default". */
+  permissionProfile?: string | null;
 }
 
 export interface ThreadExecution {
@@ -68,6 +71,8 @@ export class AgentThreadManager {
     }
 
     const env = agentEnvironment(this.baseEnv, { AGENTDOCK_TASK_ID: input.taskId, AGENTDOCK_ROLE: input.role });
+    // The profile is the security policy for this run: provider-native flags + OS sandbox derive from it.
+    const profile: PermissionProfile = resolveProfile(input.permissionProfile);
     let outcome: AgentRunOutcome | null = null;
     let failure: ThreadExecution["failure"] = null;
     try {
@@ -78,8 +83,9 @@ export class AgentThreadManager {
         prompt: input.prompt,
         resumeSessionId: thread.externalSessionId,
         revisionRequest: input.revisionRequest,
-        timeoutMs: input.timeoutMs,
+        timeoutMs: profile.stepTimeoutMs > 0 ? Math.min(input.timeoutMs, profile.stepTimeoutMs) : input.timeoutMs,
         env,
+        profile,
       });
       // Session loss fallback: resume produced no usable session — retry fresh with durable context.
       if (thread.externalSessionId && outcome.externalSessionId === null && (outcome.exitCode ?? 1) !== 0) {
@@ -88,7 +94,7 @@ export class AgentThreadManager {
           taskId: input.taskId, role: input.role, worktreePath: task.worktreePath,
           prompt: `${input.revisionRequest}\n\n${input.prompt}`,
           resumeSessionId: null, revisionRequest: input.revisionRequest,
-          timeoutMs: input.timeoutMs, env,
+          timeoutMs: profile.stepTimeoutMs > 0 ? Math.min(input.timeoutMs, profile.stepTimeoutMs) : input.timeoutMs, env, profile,
         });
       }
     } catch (error) {

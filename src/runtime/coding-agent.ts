@@ -1,4 +1,5 @@
 import type { ProcessRunner } from "./process-runner.js";
+import type { PermissionProfile } from "../security/permissions.js";
 
 /** Context handed to a coding agent for one step execution. */
 export interface AgentRunContext {
@@ -13,6 +14,8 @@ export interface AgentRunContext {
   revisionRequest: string;
   timeoutMs: number;
   env: Record<string, string>;
+  /** Effective permission profile; agents derive their sandbox flags from it. */
+  profile: PermissionProfile;
 }
 
 export interface AgentRunOutcome {

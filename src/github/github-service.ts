@@ -152,6 +152,33 @@ export class GitHubService {
     this.db.prepare("DELETE FROM github_fix_events WHERE task_id = ?").run(taskId);
   }
 
+  /**
+   * Executable FIX path for CI/review failures: atomically reopens the FAILED
+   * task, starts a fix workflow whose FIX prompt consumes the external
+   * triggers, and returns the run to enqueue. Callers (orchestrator/CLI) own
+   * execution; this service only reopens and starts.
+   */
+  async startFixWorkflow(taskId: string, start: (input: { taskId: string; preset: string }) => Promise<{ run: { id: string } }>): Promise<{ runId: string; triggerCount: number }> {
+    const triggers = this.pendingFixTriggers(taskId);
+    if (triggers.length === 0) throw new ValidationError(`Task ${taskId} has no pending fix triggers`);
+    const task = this.tasks.findById(taskId);
+    if (!task) throw new NotFoundError(`Task ${taskId} not found`);
+    if (task.state !== "FAILED") throw new ValidationError(`Task ${taskId} is ${task.state}; fix workflows start from FAILED tasks`);
+    if (!task.branch || !task.worktreePath) throw new ValidationError(`Task ${taskId} has no branch/worktree`);
+
+    // Reopen first; if the workflow cannot start, roll the task back to FAILED.
+    this.tasks.update(taskId, { state: "READY" }, this.now());
+    let run;
+    try {
+      run = await start({ taskId, preset: "fix" });
+    } catch (error) {
+      const current = this.tasks.findById(taskId);
+      if (current && current.state === "READY") this.tasks.update(taskId, { state: "FAILED" }, this.now());
+      throw error;
+    }
+    return { runId: run.run.id, triggerCount: triggers.length };
+  }
+
   private map(row: Record<string, unknown>): PrRecord {
     return {
       id: String(row.id), taskId: String(row.task_id), prNumber: Number(row.pr_number), prUrl: String(row.pr_url),

@@ -1,7 +1,11 @@
 import type { Database } from "../db/database.js";
 
-/** How the OS-level sandbox (layer 2) is applied. */
-export type OsSandboxMode = "none" | "macos-seatbelt" | "linux-bwrap";
+/**
+ * Layer-2 intent, resolved to a mechanism per platform at plan() time:
+ * write-jail → sandbox-exec (Seatbelt) on macOS, bwrap on Linux.
+ * "none" disables OS enforcement entirely (full-access only).
+ */
+export type OsSandboxMode = "none" | "write-jail";
 
 /** Named permission profile controlling what coding agents may do. */
 export interface PermissionProfile {
@@ -10,9 +14,15 @@ export interface PermissionProfile {
   envAllow: string[];
   /** Maximum wall-clock ms per agent step. */
   stepTimeoutMs: number;
-  /** Whether agents may access the network. Enforced by the OS sandbox and provider-native modes. */
-  networkAccess: boolean;
-  /** Extra directories agents may read beyond defaults (informational for provider-native, enforced by OS sandbox). */
+  /**
+   * Extra directories agents may read beyond defaults (enforced by the OS sandbox).
+   * Note: there is deliberately no networkAccess flag — neither Seatbelt nor
+   * bwrap can distinguish the agent CLI's own model-API traffic from its
+   * children's traffic, so a network deny would break the agent entirely.
+   * Network restriction is the provider sandbox's job (codex workspace-write
+   * defaults to localhost-only for children; claude denies WebFetch/WebSearch
+   * via --disallowedTools).
+   */
   extraReadPaths: string[];
   /**
    * Provider-native permission mode (layer 1): the agent CLI polices its own
@@ -21,19 +31,22 @@ export interface PermissionProfile {
    * "full-access" keeps the old dangerous flags for projects that opt in.
    */
   providerMode: "provider-sandboxed" | "full-access";
-  /** OS-level enforcement (layer 2): sandbox-exec on macOS, bwrap on Linux, none to disable. */
+  /**
+   * OS-level enforcement (layer 2). write-jail is fail-closed for the
+   * restricted-class profiles: when no mechanism exists on the platform the
+   * run is refused rather than silently unsandboxed.
+   */
   osSandbox: OsSandboxMode;
+  /** When true, an unavailable OS sandbox fails the run instead of degrading. */
+  failClosed: boolean;
 }
 
 export const PROFILES: Record<string, PermissionProfile> = {
-  // default: provider-native tool policing + OS write-jail. Network stays up
-  // at the OS layer (model API needs it); agent children are confined by the
-  // provider sandbox.
-  default: { name: "default", envAllow: [], stepTimeoutMs: 30 * 60 * 1000, networkAccess: true, extraReadPaths: [], providerMode: "provider-sandboxed", osSandbox: "macos-seatbelt" },
-  restricted: { name: "restricted", envAllow: [], stepTimeoutMs: 15 * 60 * 1000, networkAccess: false, extraReadPaths: [], providerMode: "provider-sandboxed", osSandbox: "macos-seatbelt" },
-  sandboxed: { name: "sandboxed", envAllow: [], stepTimeoutMs: 10 * 60 * 1000, networkAccess: false, extraReadPaths: [], providerMode: "provider-sandboxed", osSandbox: "macos-seatbelt" },
+  default: { name: "default", envAllow: [], stepTimeoutMs: 30 * 60 * 1000, extraReadPaths: [], providerMode: "provider-sandboxed", osSandbox: "write-jail", failClosed: true },
+  restricted: { name: "restricted", envAllow: [], stepTimeoutMs: 15 * 60 * 1000, extraReadPaths: [], providerMode: "provider-sandboxed", osSandbox: "write-jail", failClosed: true },
+  sandboxed: { name: "sandboxed", envAllow: [], stepTimeoutMs: 10 * 60 * 1000, extraReadPaths: [], providerMode: "provider-sandboxed", osSandbox: "write-jail", failClosed: true },
   // Legacy behavior for projects that manage isolation externally.
-  "full-access": { name: "full-access", envAllow: [], stepTimeoutMs: 30 * 60 * 1000, networkAccess: true, extraReadPaths: [], providerMode: "full-access", osSandbox: "none" },
+  "full-access": { name: "full-access", envAllow: [], stepTimeoutMs: 30 * 60 * 1000, extraReadPaths: [], providerMode: "full-access", osSandbox: "none", failClosed: false },
 };
 
 export function resolveProfile(name: string | null | undefined): PermissionProfile {
@@ -75,16 +88,7 @@ export class SecretIsolation {
  * approvals, cancellations, PR creation — everything durable state depends on.
  */
 export class AuditLog {
-  constructor(private readonly db: Database, private readonly now = () => new Date().toISOString()) {
-    this.db.exec(`CREATE TABLE IF NOT EXISTS audit_log (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      actor TEXT NOT NULL,
-      action TEXT NOT NULL,
-      task_id TEXT,
-      detail TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )`);
-  }
+  constructor(private readonly db: Database, private readonly now = () => new Date().toISOString()) {}
 
   record(entry: { actor: string; action: string; taskId?: string; detail?: Record<string, unknown> }): void {
     this.db.prepare("INSERT INTO audit_log (actor, action, task_id, detail, created_at) VALUES (?,?,?,?,?)")

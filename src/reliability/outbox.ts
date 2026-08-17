@@ -33,10 +33,15 @@ export interface OutboxEvent {
   processedAt: string | null;
 }
 
+const DEFAULT_CLAIM_TTL_MS = 60_000;
+
 /**
- * Transactional outbox: effects are recorded in the same transaction as the
- * state change that caused them, then delivered by polling. Delivery retries
- * are safe because handlers are idempotent by event id.
+ * Transactional outbox: effects are recorded alongside the state change that
+ * caused them, then delivered by polling. Claims are leases — an event claimed
+ * by one worker is invisible to others until the claim expires — so two
+ * workers never deliver the same event; a crashed worker's claims lapse and
+ * the event is redelivered. Handlers must still be idempotent by event id
+ * because at-least-once delivery is the guarantee.
  */
 export class TransactionalOutbox {
   constructor(private readonly db: Database, private readonly now = () => new Date().toISOString()) {}
@@ -47,16 +52,23 @@ export class TransactionalOutbox {
   }
 
   /**
-   * Atomically claims up to `limit` unprocessed events for `worker` and
-   * returns them. Claimed rows are still processed-at NULL (so a crash
-   * re-delivers them); the processed_by marker records the current claimer.
+   * Atomically claims up to `limit` deliverable events for `worker`. An event
+   * is deliverable when unprocessed and not held by a live claim. Claimed
+   * rows get an expiring lease; crashes are tolerated by redelivery.
    */
-  claimBatch(worker: string, limit: number): OutboxEvent[] {
+  claimBatch(worker: string, limit: number, claimTtlMs = DEFAULT_CLAIM_TTL_MS): OutboxEvent[] {
+    const now = this.now();
+    const claimExpiresAt = new Date(Date.parse(now) + claimTtlMs).toISOString();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const rows = this.db.prepare("SELECT * FROM outbox_events WHERE processed_at IS NULL ORDER BY id LIMIT ?").all(limit) as (Record<string, unknown>)[];
-      const claim = this.db.prepare("UPDATE outbox_events SET processed_by = ? WHERE id = ?");
-      for (const row of rows) claim.run(worker, Number(row.id));
+      const rows = this.db.prepare(
+        `SELECT * FROM outbox_events
+         WHERE processed_at IS NULL
+           AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
+         ORDER BY id LIMIT ?`
+      ).all(now, limit) as (Record<string, unknown>)[];
+      const claim = this.db.prepare("UPDATE outbox_events SET processed_by = ?, claim_expires_at = ? WHERE id = ?");
+      for (const row of rows) claim.run(worker, claimExpiresAt, Number(row.id));
       this.db.exec("COMMIT");
       return rows.map((row) => this.toEvent(row));
     } catch (error) {
@@ -65,9 +77,15 @@ export class TransactionalOutbox {
     }
   }
 
-  /** Marks an event delivered. Called only after its side effect succeeded. */
+  /** Marks an event delivered by its claimer. No-ops when another worker re-claimed it. */
   markProcessed(eventId: number, worker: string): void {
-    this.db.prepare("UPDATE outbox_events SET processed_at = ?, processed_by = ? WHERE id = ?").run(this.now(), worker, eventId);
+    this.db.prepare("UPDATE outbox_events SET processed_at = ?, processed_by = ? WHERE id = ? AND (claim_expires_at IS NULL OR processed_by = ?)")
+      .run(this.now(), worker, eventId, worker);
+  }
+
+  /** Releases a claim without marking processed (retryable immediately). */
+  releaseClaim(eventId: number): void {
+    this.db.prepare("UPDATE outbox_events SET claim_expires_at = NULL WHERE id = ?").run(eventId);
   }
 
   private toEvent(row: Record<string, unknown>): OutboxEvent {

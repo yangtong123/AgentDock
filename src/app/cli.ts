@@ -10,6 +10,8 @@ import { FeishuAdapter } from "../im/feishu-adapter.js";
 import { GitHubService } from "../github/github-service.js";
 import { GhCliAdapter } from "../github/gh-cli-adapter.js";
 import { Orchestrator } from "../reliability/orchestrator.js";
+import { OutboxDispatcher } from "../reliability/outbox-dispatcher.js";
+import { TransactionalOutbox } from "../reliability/outbox.js";
 
 function option(args:string[],name:string,required=true):string|undefined { const i=args.indexOf(`--${name}`); const value=i>=0?args[i+1]:undefined; if(required&&!value) throw new Error(`Missing --${name}`); return value; }
 function has(args:string[],name:string):boolean { return args.includes(`--${name}`); }
@@ -29,7 +31,7 @@ Usage:
   agentdock task cleanup --task-id ID [--force]
   agentdock task status --task-id ID
   agentdock task diff --task-id ID [--stat]
-  agentdock workflow start --task-id ID --preset fast|cross-review|careful [--provider STEP=NAME ...]
+  agentdock workflow start --task-id ID --preset fast|cross-review|careful|fix [--provider STEP=NAME ...]
   agentdock workflow execute --run-id ID
   agentdock workflow status --run-id ID
   agentdock workflow approve --run-id ID [--reject]
@@ -37,6 +39,7 @@ Usage:
   agentdock github create-pr --task-id ID --title TEXT
   agentdock github refresh --task-id ID
   agentdock github reviews --task-id ID
+  agentdock github fix --task-id ID (reopen + start fix workflow for CI/review failures)
   agentdock metrics summary
   agentdock metrics usage --task-id ID
   agentdock audit [--task-id ID] [--limit 50]
@@ -69,11 +72,15 @@ try {
     // The orchestrator owns execution: leases, concurrency, timeouts, recovery.
     const orchestrator=new Orchestrator(db,app,app.processRunner,{});
     controller.attachOrchestrator(orchestrator);
+    // Outbox delivery: terminal run events notify the IM conversation that started the task.
+    const dispatcher=new OutboxDispatcher(db,new TransactionalOutbox(db),(conversationId,text)=>controller.notify(conversationId,text),"serve-dispatcher");
+    controller.attachNotifier(dispatcher);
     await controller.startAll();
     await orchestrator.start();
+    await dispatcher.start();
     const adapters=[telegramToken?"telegram":null,feishuPort>0?"feishu":null].filter(Boolean).join("+")||"no IM adapters configured";
     console.log(`AgentDock serving (${adapters}). Ctrl-C to stop.`);
-    const shutdown=async()=>{ await orchestrator.stop(); await controller.stopAll(); db.close(); process.exit(0); };
+    const shutdown=async()=>{ await dispatcher.stop(); await orchestrator.stop(); await controller.stopAll(); db.close(); process.exit(0); };
     process.on("SIGINT",()=>{ void shutdown(); });
     process.on("SIGTERM",()=>{ void shutdown(); });
     await new Promise(()=>{});
@@ -114,6 +121,11 @@ try {
   else if(resource==="github"&&action==="reviews") {
     const github=new GitHubService(db,new GhCliAdapter(),app.repositories.tasks,app.repositories.projects);
     console.log(JSON.stringify(await github.ingestReviews(option(args,"task-id")!),null,2));
+  }
+  else if(resource==="github"&&action==="fix") {
+    const github=new GitHubService(db,new GhCliAdapter(),app.repositories.tasks,app.repositories.projects);
+    const { runId, triggerCount }=await github.startFixWorkflow(option(args,"task-id")!,(input)=>app.workflows.start(input));
+    console.log(JSON.stringify({runId,triggerCount,queued:false,hint:"run: agentdock workflow execute --run-id "+runId},null,2));
   }
   else if(resource==="metrics"&&action==="summary") console.log(JSON.stringify({steps:app.metrics.stepMetrics(),tasks:app.metrics.taskMetrics()},null,2));
   else if(resource==="metrics"&&action==="usage") console.log(JSON.stringify(app.metrics.usageForTask(option(args,"task-id")!),null,2));

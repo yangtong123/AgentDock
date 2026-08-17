@@ -3,52 +3,60 @@ import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 
 export interface SandboxPlan {
-  /** Effective mode after capability detection (e.g. bwrap requested but missing → none + warning). */
+  /** Effective mode after platform/capability resolution. */
   mode: OsSandboxMode;
-  /** Wrapped argv; identical to input when mode is none. */
+  /** Mechanism actually used: informative for audit and stderr notes. */
+  mechanism: "none" | "seatbelt" | "bwrap";
+  /** Wrapped argv; identical to input when mechanism is none. */
   argv: string[];
-  /** Set when the requested mode was unavailable and enforcement was skipped. */
+  /** Set when enforcement was skipped (failClosed=false profiles only). */
   fallbackReason: string | null;
+}
+
+/** Raised when a fail-closed profile cannot be enforced on this platform. */
+export class SandboxUnavailableError extends Error {
+  constructor(reason: string) { super(`OS sandbox unavailable: ${reason}`); this.name = "SandboxUnavailableError"; }
 }
 
 /**
  * Layer-2 OS sandbox: wraps agent argv with sandbox-exec (macOS Seatbelt) or
- * bwrap (Linux) so a compromised agent cannot write outside its worktree or,
- * when the profile forbids it, reach the network — regardless of what the
- * agent CLI itself allows. The profile is the policy; this is the
- * enforcement that does not trust the agent.
+ * bwrap (Linux) so a compromised agent cannot write outside its worktree —
+ * regardless of what the agent CLI itself allows. The profile declares the
+ * platform-neutral "write-jail" intent; plan() resolves it to a mechanism.
+ * Profiles marked failClosed refuse to run when no mechanism exists instead
+ * of silently executing unsandboxed.
  */
 export class OsSandbox {
   private static bwrapAvailable: boolean | null = null;
 
-  /** Resolves the plan for one agent invocation. Pure: no I/O beyond capability flags. */
+  /** Test seam: override the bwrap capability probe. */
+  static setBwrapAvailable(available: boolean | null): void { OsSandbox.bwrapAvailable = available; }
+
+  /** Resolves the plan for one agent invocation. Throws SandboxUnavailableError when fail-closed and unenforceable. */
   static plan(profile: PermissionProfile, worktreePath: string, argv: string[], options: { bwrapAvailable?: boolean } = {}): SandboxPlan {
-    const requested = profile.osSandbox;
-    if (requested === "none") return { mode: "none", argv, fallbackReason: null };
-    if (requested === "macos-seatbelt") {
-      if (process.platform !== "darwin") {
-        return { mode: "none", argv, fallbackReason: "macos-seatbelt requested on non-darwin platform" };
-      }
-      return { mode: requested, argv: ["sandbox-exec", "-p", this.seatbeltProfile(profile, worktreePath), "--", ...argv], fallbackReason: null };
+    if (profile.osSandbox === "none") return { mode: "none", mechanism: "none", argv, fallbackReason: null };
+
+    if (process.platform === "darwin") {
+      return { mode: "write-jail", mechanism: "seatbelt", argv: ["sandbox-exec", "-p", this.seatbeltProfile(profile, worktreePath), "--", ...argv], fallbackReason: null };
     }
-    // linux-bwrap
-    const available = options.bwrapAvailable ?? this.detectBwrap();
-    if (!available) {
-      return { mode: "none", argv, fallbackReason: "linux-bwrap requested but bwrap is not installed" };
+
+    const bwrapAvailable = options.bwrapAvailable ?? this.detectBwrap();
+    if (bwrapAvailable) {
+      return { mode: "write-jail", mechanism: "bwrap", argv: this.bwrapArgv(profile, worktreePath, argv), fallbackReason: null };
     }
-    return { mode: requested, argv: this.bwrapArgv(profile, worktreePath, argv), fallbackReason: null };
+
+    const reason = `write-jail requested but no mechanism exists on ${process.platform} (install bubblewrap)`;
+    if (profile.failClosed) throw new SandboxUnavailableError(reason);
+    return { mode: "none", mechanism: "none", argv, fallbackReason: reason };
   }
 
   /**
    * Seatbelt profile: writes confined to the worktree, agent config/cache dirs
    * (~/.claude, ~/.codex), and tmp. Everything else is read-only. Network is
    * NOT denied here: the agent CLI's own model-API traffic would break, and
-   * Seatbelt cannot distinguish it from child-process traffic. Agent-child
-   * network restriction is the provider sandbox's job (codex workspace-write
-   * defaults to localhost-only; claude denies WebFetch/WebSearch via
-   * --disallowedTools). Paths are realpath-normalized because Seatbelt matches
-   * literal prefixes — /tmp vs /private/tmp mismatches would silently deny
-   * legitimate writes.
+   * Seatbelt cannot distinguish it from child-process traffic. Paths are
+   * realpath-normalized because Seatbelt matches literal prefixes — /tmp vs
+   * /private/tmp mismatches would silently deny legitimate writes.
    */
   static seatbeltProfile(profile: PermissionProfile, worktreePath: string): string {
     const home = process.env.HOME ?? "/Users/unknown";
@@ -73,11 +81,6 @@ ${writeRules}
 `;
   }
 
-  /** realpath with a fallback for paths that do not exist yet (worktrees are created before first run). */
-  private static normalize(path: string): string {
-    try { return realpathSync(path); } catch { return path; }
-  }
-
   static bwrapArgv(profile: PermissionProfile, worktreePath: string, argv: string[]): string[] {
     const home = process.env.HOME ?? "/home/unknown";
     const args = [
@@ -95,6 +98,11 @@ ${writeRules}
     // Network stays up: --unshare-net would also kill the agent's model-API traffic.
     args.push("--", ...argv);
     return args;
+  }
+
+  /** realpath with a fallback for paths that do not exist yet (worktrees are created before first run). */
+  private static normalize(path: string): string {
+    try { return realpathSync(path); } catch { return path; }
   }
 
   private static escape(path: string): string {

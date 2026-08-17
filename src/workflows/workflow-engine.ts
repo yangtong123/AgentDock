@@ -81,7 +81,7 @@ export class WorkflowEngine {
     validateMaxReviewRounds(input.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS);
 
     const timestamp = this.now();
-    const run: WorkflowRun = { id: randomUUID(), taskRevisionId: revision.id, preset: input.preset, state: "QUEUED", maxReviewRounds: input.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS, createdAt: timestamp, updatedAt: timestamp };
+    const run: WorkflowRun = { id: randomUUID(), taskRevisionId: revision.id, preset: input.preset, state: "QUEUED", maxReviewRounds: input.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS, stepTimeoutMs: input.stepTimeoutMs ?? DEFAULT_STEP_TIMEOUT_MS, createdAt: timestamp, updatedAt: timestamp };
     this.workflows.createRun(run);
     this.tasks.update(task.id, { state: "RUNNING" }, timestamp);
     for (const [index, step] of steps.entries()) {
@@ -93,9 +93,9 @@ export class WorkflowEngine {
   async execute(runId: string): Promise<WorkflowStatus> {
     this.requireResumable(runId);
     const { task, revision } = this.contextForRun(runId);
-    const stepTimeoutMs = this.stepTimeoutMs();
     const run = this.requireRun(runId);
     const maxRounds = run.maxReviewRounds;
+    const stepTimeoutMs = run.stepTimeoutMs;
 
     this.workflows.updateRun(runId, { state: "RUNNING", updatedAt: this.now() });
     const threads = new Map<string, string>(); // role -> thread id, for RESUME session policy
@@ -312,7 +312,6 @@ export class WorkflowEngine {
     }
   }
 
-  private stepTimeoutMs(): number { return DEFAULT_STEP_TIMEOUT_MS; }
 
   private requireRun(runId: string): WorkflowRun {
     const run = this.workflows.findRun(runId);

@@ -28,6 +28,8 @@ export const DEFAULT_PROVIDERS: Record<StepType, string> = {
 const fast: StepType[] = ["IMPLEMENT", "VERIFY"];
 const crossReview: StepType[] = ["IMPLEMENT", "VERIFY", "REVIEW", "FIX", "VERIFY", "FINAL_REVIEW"];
 const careful: StepType[] = ["PLAN", "HUMAN_APPROVAL", "IMPLEMENT", "VERIFY", "REVIEW", "FIX", "VERIFY", "FINAL_REVIEW", "HUMAN_APPROVAL"];
+/** Re-entry preset for CI/review failures: fix against external triggers, verify, re-review. */
+const fix: StepType[] = ["FIX", "VERIFY", "REVIEW"];
 
 /**
  * Presets expand to step sequences; provider assignment happens at expansion
@@ -35,8 +37,8 @@ const careful: StepType[] = ["PLAN", "HUMAN_APPROVAL", "IMPLEMENT", "VERIFY", "R
  * configurable per step — roles and providers stay decoupled.
  */
 export function expandPreset(preset: string, providers: ProviderAssignment = {}): WorkflowStepDefinition[] {
-  const sequences: Record<string, StepType[]> = { fast, "cross-review": crossReview, careful };
+  const sequences: Record<string, StepType[]> = { fast, "cross-review": crossReview, careful, fix };
   const sequence = sequences[preset];
-  if (!sequence) throw new ValidationError(`Unknown workflow preset: ${preset} (expected fast, cross-review, or careful)`);
+  if (!sequence) throw new ValidationError(`Unknown workflow preset: ${preset} (expected fast, cross-review, careful, or fix)`);
   return sequence.map((stepType) => ({ stepType, provider: providers[stepType] ?? DEFAULT_PROVIDERS[stepType] }));
 }

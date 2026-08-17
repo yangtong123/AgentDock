@@ -93,7 +93,8 @@ test("controller: full flow /run -> approval gate -> approve releases it", async
     const approveCommand = runReply.actions!.find((a) => a.label === "Approve")!.command;
     assert.equal(approveCommand.type, "APPROVE_RUN");
     const approved = await f.controller.handle(approveCommand);
-    assert.match(approved.text, /another approval gate|finished/);
+    // No orchestrator attached in this fixture: approval executes inline.
+    assert.match(approved.text, /another approval gate|finished|resumed/);
     assert.equal(f.app.tasks.list(project.id)[0]!.state !== "DRAFT", true);
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });

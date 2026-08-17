@@ -18,6 +18,8 @@ export class ImController {
   private readonly adapters = new Map<string, ImAdapter>();
   private readonly audit: AuditLog;
   private orchestrator: Orchestrator | null = null;
+  private notifier: { subscribe(conversationId: string, taskId: string): void } | null = null;
+  private readonly conversationOrigins = new Map<string, string>();
 
   constructor(
     private readonly db: Database,
@@ -30,6 +32,11 @@ export class ImController {
   /** Attach the orchestrator so runs execute under leases/concurrency, not inline. */
   attachOrchestrator(orchestrator: Orchestrator): void { this.orchestrator = orchestrator; }
 
+  /** Outbox dispatcher: terminal run events notify the conversation that started them. */
+  attachNotifier(notifier: { subscribe(conversationId: string, taskId: string): void }): void { this.notifier = notifier; }
+
+  private trackTaskInterest(conversationId: string, taskId: string): void { this.notifier?.subscribe(conversationId, taskId); }
+
   register(adapter: ImAdapter): void {
     adapter.onMessage(async (message) => {
       const command = parseCommand(message.conversationId, message.text);
@@ -37,6 +44,22 @@ export class ImController {
     });
     adapter.onAction(async (command) => { await this.handle(command, adapter.name); });
     this.adapters.set(adapter.name, adapter);
+  }
+
+  /** Remembers which adapter a conversation came from (notifications route back through it). */
+  private rememberConversationAdapter(conversationId: string, adapterName: string): void {
+    this.db.prepare(`INSERT INTO im_conversations (conversation_id, adapter, project_id, focused_task_id, updated_at) VALUES (?, 'origin', NULL, NULL, ?)
+      ON CONFLICT (conversation_id, adapter) DO NOTHING`).run(conversationId, this.now());
+    this.conversationOrigins.set(conversationId, adapterName);
+  }
+
+  /** Outbox dispatcher entry point: push a notification to the conversation's adapter. */
+  async notify(conversationId: string, text: string): Promise<void> {
+    const origin = this.conversationOrigins.get(conversationId);
+    const adapter = origin !== undefined ? this.adapters.get(origin) : undefined;
+    if (adapter !== undefined) { await adapter.send({ conversationId, text }); return; }
+    // Unknown origin (pre-restart conversation): try every adapter; wrong-platform sends fail silently.
+    for (const candidate of this.adapters.values()) await candidate.send({ conversationId, text }).catch(() => undefined);
   }
 
   async startAll(): Promise<void> {
@@ -53,6 +76,7 @@ export class ImController {
     const entry: { actor: string; action: string; detail: Record<string, unknown> } & { taskId?: string } = { actor: command.conversationId, action: command.type, detail: { originAdapter: originAdapter ?? "internal" } };
     if (taskId !== undefined) entry.taskId = taskId;
     this.audit.record(entry);
+    if (originAdapter !== undefined) this.rememberConversationAdapter(command.conversationId, originAdapter);
     const reply = await this.dispatch(command);
     if (originAdapter !== undefined) {
       const adapter = this.adapters.get(originAdapter);
@@ -97,6 +121,7 @@ export class ImController {
             const started = await this.app.workflows.start({ taskId: command.taskId, preset: command.preset });
             if (this.orchestrator !== null) {
               // Production path: the orchestrator executes under lease/concurrency and notifies via outbox.
+              this.trackTaskInterest(command.conversationId, command.taskId);
               this.orchestrator.queue.enqueue(command.taskId);
               return respond(`Run ${started.run.id} queued.`);
             }
@@ -141,15 +166,13 @@ export class ImController {
         }
         case "APPROVE_RUN": {
           this.app.workflows.approve(command.runId, command.approved);
-          if (command.approved) {
-            const status = await this.app.workflows.execute(command.runId);
-            return respond(status.awaitingApproval ? "Approved. The workflow pauses at another approval gate." : `Approved. Run finished: ${status.run.state}.`);
-          }
-          return respond("Rejected. The workflow is cancelled.");
+          if (!command.approved) return respond("Rejected. The workflow is cancelled.");
+          // Resumed execution goes through the orchestrator like any other run:
+          // lease, concurrency gates, task timeout, and crash recovery all apply.
+          return respond(this.resumeRun(command.runId, command.conversationId));
         }
         case "CONTINUE_RUN": {
-          const status = await this.app.workflows.execute(command.runId);
-          return respond(status.awaitingApproval ? "Run paused at another approval gate." : `Run continued: ${status.run.state}.`);
+          return respond(this.resumeRun(command.runId, command.conversationId));
         }
         case "VIEW_DIFF": {
           const diff = await this.app.worktrees.diff(command.taskId, { stat: command.statOnly });
@@ -170,6 +193,25 @@ export class ImController {
       if (status.run.state !== "SUCCEEDED" && status.run.state !== "FAILED" && status.run.state !== "CANCELLED") return status;
     }
     return null;
+  }
+
+  /** Resumes an approved/paused run: enqueued under the orchestrator when attached. */
+  private resumeRun(runId: string, conversationId?: string): string {
+    const taskId = this.taskIdForRun(runId);
+    if (taskId !== null && this.orchestrator !== null) {
+      if (conversationId !== undefined) this.trackTaskInterest(conversationId, taskId);
+      this.orchestrator.queue.enqueue(taskId);
+      return `Run ${runId} resumed: queued for the orchestrator.`;
+    }
+    if (taskId === null) return `Run ${runId} resumed.`;
+    // No orchestrator (tests, CLI-driven usage): execute inline as before.
+    void this.app.workflows.execute(runId).catch(() => undefined);
+    return `Run ${runId} resumed.`;
+  }
+
+  private taskIdForRun(runId: string): string | null {
+    const row = this.db.prepare(`SELECT tr.task_id AS taskId FROM workflow_runs wr JOIN task_revisions tr ON wr.task_revision_id = tr.id WHERE wr.id = ?`).get(runId) as { taskId: string } | undefined;
+    return row?.taskId ?? null;
   }
 
   private focus(conversationId: string): string | null {

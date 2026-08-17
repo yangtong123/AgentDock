@@ -38,10 +38,20 @@ test("TransactionalOutbox publishes, claims batches, and marks processed", () =>
   const batch = outbox.claimBatch("w1", 10);
   assert.equal(batch.length, 2);
   assert.deepEqual(JSON.parse(batch[0]!.payload), { runId: "r1" });
+  // A live claim hides the event from other workers.
+  const contested = outbox.claimBatch("w2", 10);
+  assert.equal(contested.length, 0, "claimed events are invisible until the lease expires");
   outbox.markProcessed(batch[0]!.id, "w1");
-  const remaining = outbox.claimBatch("w2", 10);
-  assert.equal(remaining.length, 1);
-  assert.equal(remaining[0]!.id, batch[1]!.id);
+  // markProcessed by the wrong owner (expired + re-claimed) is a no-op.
+  clock.advance(120_000); // claim TTL (60s) expires
+  const reclaimer = outbox.claimBatch("w2", 10);
+  assert.equal(reclaimer.length, 1, "unprocessed event is redelivered after lease expiry");
+  outbox.markProcessed(reclaimer[0]!.id, "w1"); // stale worker tries to close it
+  const stillOpen = db.prepare("SELECT COUNT(*) c FROM outbox_events WHERE processed_at IS NULL AND id = ?").get(reclaimer[0]!.id) as { c: number };
+  assert.equal(Number(stillOpen.c), 1, "stale owner cannot mark processed");
+  outbox.markProcessed(reclaimer[0]!.id, "w2");
+  const done = db.prepare("SELECT COUNT(*) c FROM outbox_events WHERE processed_at IS NULL").get() as { c: number };
+  assert.equal(Number(done.c), 0, "current claimer closes the event");
   db.close();
 });
 

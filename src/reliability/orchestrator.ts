@@ -12,7 +12,6 @@ export interface OrchestratorOptions {
   globalConcurrency?: number;
   pollMs?: number;
   taskTimeoutMs?: number;
-  stepTimeoutMs?: number;
 }
 
 const DEFAULTS = { leaseTtlMs: 60_000, heartbeatMs: 15_000, globalConcurrency: 3, pollMs: 2_000, taskTimeoutMs: 2 * 60 * 60 * 1000, stepTimeoutMs: 30 * 60 * 1000 };
@@ -61,11 +60,16 @@ export class Orchestrator {
 
   /** Recovery pass: RUNNING tasks with an in-flight run but no live lease are failed. */
   recoverOrphans(): { taskId: string; runId: string | null }[] {
-    // A run still QUEUED was never picked up by a worker — it is not an orphan, just pending.
+    // A run still QUEUED was never picked up by a worker — pending, not orphaned.
+    // A run paused at a HUMAN_APPROVAL gate is legitimately idle — never an orphan.
     const stuck = this.db.prepare(`SELECT t.id FROM tasks t
       WHERE t.state = 'RUNNING'
       AND EXISTS (SELECT 1 FROM workflow_runs r JOIN task_revisions rev ON r.task_revision_id = rev.id
-                  WHERE rev.task_id = t.id AND r.state IN ('RUNNING','CANCEL_REQUESTED'))`).all() as { id: string }[];
+                  WHERE rev.task_id = t.id AND r.state IN ('RUNNING','CANCEL_REQUESTED')
+                    AND NOT EXISTS (SELECT 1 FROM step_runs g WHERE g.workflow_run_id = r.id
+                                    AND g.step_type = 'HUMAN_APPROVAL' AND g.state = 'QUEUED'
+                                    AND NOT EXISTS (SELECT 1 FROM step_runs p WHERE p.workflow_run_id = r.id
+                                                    AND p.sequence < g.sequence AND p.state NOT IN ('SUCCEEDED'))))`).all() as { id: string }[];
     const results: { taskId: string; runId: string | null }[] = [];
     for (const { id } of stuck) {
       const live = this.db.prepare("SELECT lease_key FROM worker_leases WHERE task_id = ? AND expires_at > ?").get(id, this.clock.now().toISOString());
@@ -114,6 +118,30 @@ export class Orchestrator {
     this.outbox.publish({ taskId, type: "task.cancel-requested", payload: { taskId } });
   }
 
+  /**
+   * CI/review fix path: FAILED tasks with pending github fix triggers are
+   * reopened into a fix workflow and enqueued. Invoked from the poll loop so
+   * `github refresh/reviews` alone eventually triggers the fix run.
+   */
+  async runPendingFixes(): Promise<{ taskId: string; runId: string }[]> {
+    const started: { taskId: string; runId: string }[] = [];
+    const rows = this.db.prepare(`SELECT DISTINCT task_id FROM github_fix_events`).all() as { task_id: string }[];
+    for (const { task_id: taskId } of rows) {
+      const task = this.app.repositories.tasks.findById(taskId);
+      if (!task || task.state !== "FAILED") continue;
+      if (this.activeRunId(taskId) !== null) continue; // a run is already open
+      try {
+        const { runId } = await this.app.github.startFixWorkflow(taskId, (input) => this.app.workflows.start(input));
+        this.queue.enqueue(taskId);
+        started.push({ taskId, runId });
+        this.outbox.publish({ taskId, workflowRunId: runId, type: "fix.started", payload: { taskId, runId } });
+      } catch {
+        // Not startable right now (no worktree, mid-transition): retried on the next sweep.
+      }
+    }
+    return started;
+  }
+
   private async runLoop(): Promise<void> {
     const pollMs = this.options.pollMs ?? DEFAULTS.pollMs;
     const heartbeatMs = this.options.heartbeatMs ?? DEFAULTS.heartbeatMs;
@@ -123,6 +151,7 @@ export class Orchestrator {
       if (this.clock.now().getTime() - lastReap >= 5 * pollMs) {
         lastReap = this.clock.now().getTime();
         this.recoverOrphans();
+        void this.runPendingFixes().catch(() => undefined);
       }
       const entry = this.queue.nextDue(
         this.runningCountByProject(),

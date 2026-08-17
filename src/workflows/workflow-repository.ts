@@ -1,9 +1,9 @@
 import type { Database } from "../db/database.js";
 import type { RunState, StepRun, StepType, WorkflowRun } from "../shared/domain.js";
 import { NotFoundError } from "../shared/domain.js";
-type WorkflowRow={id:string;task_revision_id:string;preset:string|null;state:RunState;max_review_rounds:number;created_at:string;updated_at:string};
+type WorkflowRow={id:string;task_revision_id:string;preset:string|null;state:RunState;max_review_rounds:number;step_timeout_ms:number;created_at:string;updated_at:string};
 type StepRow={id:string;workflow_run_id:string;step_type:StepType;state:RunState;provider:string|null;sequence:number;created_at:string;updated_at:string};
-const mapWorkflow=(r:WorkflowRow):WorkflowRun=>({id:r.id,taskRevisionId:r.task_revision_id,preset:r.preset,state:r.state,maxReviewRounds:r.max_review_rounds,createdAt:r.created_at,updatedAt:r.updated_at});
+const mapWorkflow=(r:WorkflowRow):WorkflowRun=>({id:r.id,taskRevisionId:r.task_revision_id,preset:r.preset,state:r.state,maxReviewRounds:r.max_review_rounds,stepTimeoutMs:r.step_timeout_ms,createdAt:r.created_at,updatedAt:r.updated_at});
 export interface WorkflowRunChanges { state?: RunState; updatedAt?: string }
 export interface StepRunChanges { state?: RunState; updatedAt?: string }
 export interface WorkflowRepository {
@@ -19,7 +19,7 @@ export interface WorkflowRepository {
 }
 export class SqliteWorkflowRepository implements WorkflowRepository {
   constructor(private readonly db:Database){}
-  createRun(r:WorkflowRun):WorkflowRun { this.db.prepare("INSERT INTO workflow_runs (id,task_revision_id,preset,state,max_review_rounds,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").run(r.id,r.taskRevisionId,r.preset,r.state,r.maxReviewRounds,r.createdAt,r.updatedAt); return r; }
+  createRun(r:WorkflowRun):WorkflowRun { this.db.prepare("INSERT INTO workflow_runs (id,task_revision_id,preset,state,max_review_rounds,step_timeout_ms,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(r.id,r.taskRevisionId,r.preset,r.state,r.maxReviewRounds,r.stepTimeoutMs,r.createdAt,r.updatedAt); return r; }
   findRun(id:string):WorkflowRun|undefined { const r=this.db.prepare("SELECT * FROM workflow_runs WHERE id=?").get(id) as WorkflowRow|undefined; return r&&mapWorkflow(r); }
   updateRun(id:string,changes:WorkflowRunChanges):WorkflowRun { const sets:string[]=[]; const values:(string|null)[]=[]; if(changes.state!==undefined){sets.push("state = ?");values.push(changes.state);} sets.push("updated_at = ?"); values.push(changes.updatedAt??new Date().toISOString()); const result=this.db.prepare(`UPDATE workflow_runs SET ${sets.join(", ")} WHERE id = ?`).run(...values,id); if(result.changes!==1) throw new NotFoundError(`WorkflowRun ${id} not found`); return this.findRun(id)!; }
   createStep(s:StepRun):StepRun { this.db.prepare("INSERT INTO step_runs (id,workflow_run_id,step_type,state,provider,sequence,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(s.id,s.workflowRunId,s.stepType,s.state,s.provider,s.sequence,s.createdAt,s.updatedAt); return s; }

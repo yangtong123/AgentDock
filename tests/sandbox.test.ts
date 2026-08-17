@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ProcessRunner } from "../src/runtime/process-runner.js";
-import { OsSandbox } from "../src/runtime/os-sandbox.js";
+import { OsSandbox, SandboxUnavailableError } from "../src/runtime/os-sandbox.js";
 import { PROFILES, resolveProfile } from "../src/security/permissions.js";
 import { ClaudeAgent, CodexAgent } from "../src/runtime/env-agents.js";
 
@@ -28,6 +28,10 @@ test("layer 1: claude uses permission mode + tool allowlist unless full-access",
   assert.equal(args[args.indexOf("--permission-mode") + 1], "acceptEdits");
   assert.ok(args.includes("--allowedTools"));
   assert.ok(args.includes("--disallowedTools"), "web tools are denied");
+  const allowedIndex = args.indexOf("--allowedTools");
+  const disallowedIndex = args.indexOf("--disallowedTools");
+  const allowedList = args.slice(allowedIndex + 1, disallowedIndex);
+  assert.ok(!allowedList.some((tool) => tool.startsWith("Bash(node") || tool.startsWith("Bash(npm") || tool.startsWith("Bash(npx")), "no arbitrary-code Bash entries");
 
   const fullAccess = new ClaudeAgent(runner);
   await fullAccess.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {}, profile: { ...PROFILES["default"]!, providerMode: "full-access" } });
@@ -57,28 +61,50 @@ test("layer 2: seatbelt profile denies writes outside allowlisted paths", () => 
   assert.match(sbProfile, /allow network\*/);
 });
 
-test("layer 2: plan() wraps argv with sandbox-exec on darwin, degrades elsewhere", () => {
+test("layer 2: plan() resolves write-jail per platform and fails closed when unenforceable", () => {
   const profile = PROFILES["restricted"]!;
   const wrapped = OsSandbox.plan(profile, "/wt", ["claude", "-p", "hi"]);
   if (process.platform === "darwin") {
-    assert.equal(wrapped.mode, "macos-seatbelt");
-    assert.deepEqual(wrapped.argv.slice(0, 3), ["sandbox-exec", "-p", wrapped.argv[2]!]);
+    assert.equal(wrapped.mode, "write-jail");
+    assert.equal(wrapped.mechanism, "seatbelt");
+    assert.deepEqual(wrapped.argv.slice(0, 2), ["sandbox-exec", "-p"]);
     assert.deepEqual(wrapped.argv.slice(4), ["claude", "-p", "hi"]);
     assert.equal(wrapped.fallbackReason, null);
   } else {
-    assert.equal(wrapped.mode, "none");
-    assert.match(wrapped.fallbackReason!, /non-darwin/);
+    // Non-darwin without bwrap: fail-closed profiles refuse rather than run unsandboxed.
+    assert.throws(() => OsSandbox.plan(profile, "/wt", ["claude"], { bwrapAvailable: false }), SandboxUnavailableError);
   }
   const none = OsSandbox.plan(PROFILES["full-access"]!, "/wt", ["claude"]);
   assert.equal(none.mode, "none");
   assert.deepEqual(none.argv, ["claude"]);
 
-  const linux = OsSandbox.plan({ ...PROFILES["restricted"]!, osSandbox: "linux-bwrap" }, "/wt", ["codex", "exec"], { bwrapAvailable: false });
-  assert.equal(linux.mode, "none");
-  assert.match(linux.fallbackReason!, /bwrap is not installed/);
-  const linuxOk = OsSandbox.plan({ ...PROFILES["restricted"]!, osSandbox: "linux-bwrap" }, "/wt", ["codex", "exec"], { bwrapAvailable: true });
-  assert.equal(linuxOk.mode, "linux-bwrap");
-  assert.ok(!linuxOk.argv.includes("--unshare-net"), "network stays up for model API");
+  if (process.platform !== "darwin") {
+    // Linux with bwrap: write-jail resolves to bwrap; network stays up for the model API.
+    OsSandbox.setBwrapAvailable(true);
+    try {
+      const bwrapPlan = OsSandbox.plan(profile, "/wt", ["codex", "exec"]);
+      assert.equal(bwrapPlan.mode, "write-jail");
+      assert.equal(bwrapPlan.mechanism, "bwrap");
+      assert.ok(!bwrapPlan.argv.includes("--unshare-net"));
+      // Without bwrap and fail-closed: refused. Non-fail-closed: degraded with a note.
+      const degraded = OsSandbox.plan({ ...profile, failClosed: false }, "/wt", ["codex"], { bwrapAvailable: false });
+      assert.equal(degraded.mode, "none");
+      assert.match(degraded.fallbackReason!, /no mechanism exists/);
+    } finally { OsSandbox.setBwrapAvailable(null); }
+  }
+});
+
+test("layer 2: fail-closed profiles surface refusal as a failed step, never run unsandboxed", async () => {
+  if (process.platform === "darwin") return; // darwin always has seatbelt
+  const { runner, argv } = spyRunner();
+  const codex = new CodexAgent(runner);
+  OsSandbox.setBwrapAvailable(false);
+  try {
+    const outcome = await codex.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", profile: PROFILES["restricted"]!, prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
+    assert.equal(outcome.exitCode, 1);
+    assert.match(outcome.stderr, /OS sandbox unavailable/);
+    assert.deepEqual(argv(), [], "no process was spawned");
+  } finally { OsSandbox.setBwrapAvailable(null); }
 });
 
 test("layer 2 (integration): sandbox-exec blocks a write outside the worktree", async () => {
@@ -107,6 +133,6 @@ test("layer 2 (integration): sandbox-exec blocks a write outside the worktree", 
 
 test("resolveProfile validates profile names", () => {
   assert.equal(resolveProfile(null).name, "default");
-  assert.equal(resolveProfile("restricted").osSandbox, "macos-seatbelt");
+  assert.equal(resolveProfile("restricted").osSandbox, "write-jail");
   assert.throws(() => resolveProfile("bogus"), /Unknown permission profile/);
 });

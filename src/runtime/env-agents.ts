@@ -1,7 +1,7 @@
 import type { CodingAgent, AgentRunContext, AgentRunOutcome } from "./coding-agent.js";
 import type { ProcessRunner } from "./process-runner.js";
 import { SecretIsolation } from "../security/permissions.js";
-import { OsSandbox } from "./os-sandbox.js";
+import { OsSandbox, SandboxUnavailableError } from "./os-sandbox.js";
 
 /**
  * Environment policy: coding agents run with a controlled environment rather
@@ -17,13 +17,14 @@ export function agentEnvironment(base: NodeJS.ProcessEnv, extra: Record<string, 
 }
 
 /** Claude Code's own tool policing (layer 1). acceptEdits auto-approves file
- *  edits inside the worktree; the explicit allowlist keeps Bash to read-only
- *  inspection and git. Web tools are denied outright. */
+ *  edits inside the worktree; Bash is limited to git and read-only inspection.
+ *  No node/npm: arbitrary node code is a network escape hatch the write jail
+ *  cannot close. Web tools are denied outright. */
 function claudePermissionArgs(profile: AgentRunContext["profile"]): string[] {
   if (profile.providerMode === "full-access") return ["--dangerously-skip-permissions"];
   return [
     "--permission-mode", "acceptEdits",
-    "--allowedTools", "Read", "Glob", "Grep", "Edit", "Write", "NotebookEdit", "Bash(git *)", "Bash(ls *)", "Bash(node *)", "Bash(npm run *)", "Bash(npm test*)", "Bash(npx tsc*)",
+    "--allowedTools", "Read", "Glob", "Grep", "Edit", "Write", "NotebookEdit", "Bash(git *)", "Bash(ls *)", "Bash(grep *)", "Bash(find *)", "Bash(cat *)", "Bash(wc *)",
     "--disallowedTools", "WebFetch", "WebSearch",
   ];
 }
@@ -65,7 +66,16 @@ export class EnvCodingAgent implements CodingAgent {
     // The prompt goes through stdin when promptViaStdin is set: variadic flags
     // like --allowedTools would otherwise swallow a positional prompt argument.
     const nativeArgv = this.options.argv(context);
-    const plan = OsSandbox.plan(context.profile, context.worktreePath, nativeArgv);
+    let plan;
+    try {
+      plan = OsSandbox.plan(context.profile, context.worktreePath, nativeArgv);
+    } catch (error) {
+      if (error instanceof SandboxUnavailableError) {
+        // Fail-closed profile on an unenforceable platform: refuse as a failed step, never run unsandboxed.
+        return { exitCode: 1, stdout: "", stderr: `[agentdock] ${error.message}`, externalSessionId: null, resumed: context.resumeSessionId !== null };
+      }
+      throw error;
+    }
     const runArgs = { cwd: context.worktreePath, argv: plan.argv, env: context.env, timeoutMs: context.timeoutMs, owner: context.taskId } as const;
     const result = await this.runner.run(this.options.promptViaStdin === true ? { ...runArgs, stdin: context.prompt } : runArgs);
     return this.toOutcome(result, context, plan.fallbackReason);

@@ -1,65 +1,94 @@
 # AgentDock
 
-AgentDock is a multi-project coding-agent orchestrator. It is designed to coordinate provider-neutral coding agents across durable tasks, isolated repositories, configurable workflows, and deterministic verification.
+AgentDock is a multi-project coding-agent orchestrator. It coordinates Claude Code and Codex as interchangeable providers across durable tasks, isolated Git worktrees, configurable workflows, deterministic verification, bounded review/fix loops, and human approval gates — controlled from Telegram, Feishu/Lark, or the local CLI.
 
-## Status: V0.2 — Multi-project + Git Worktree
+**Status: V1.0** — all roadmap milestones through V1.0 are implemented. See [the roadmap](docs/ROADMAP.md).
 
-V0.2 adds Git worktree isolation on top of the V0.1 foundation: projects reference real Git repositories, tasks get isolated worktrees and branches (`agentdock/<task-id>` under the project's `worktreeRoot`), and the CLI can prepare/clean up worktrees and inspect task status/diff. It deliberately does **not** run coding agents or workflows.
+## What it does
 
-See [the roadmap](docs/ROADMAP.md) and [the V0.1 development contract](docs/tasks/V0.1-CODEX-TASK.md).
+- **Multiple projects and tasks** with durable state in SQLite; every task runs in an isolated Git worktree (`agentdock/<task-id>` branch).
+- **Claude Code and Codex as providers**, configurable per workflow step. Session resume with fallback to durable task context when a session is lost.
+- **Workflows**: `fast` (implement → verify), `cross-review` (implement → verify → review → fix loop → final review), `careful` (adds plan + human approval gates), and `fix` (re-entry for CI/review failures). Bounded review/fix loops with `maxReviewRounds`.
+- **Deterministic verification** outranks LLM review: projects declare a verify command (argv array) that the VERIFY step executes in the worktree.
+- **Reliability**: worker leases and heartbeats, task queue with priority/scheduling and global/per-project concurrency, owner-scoped process-tree cancellation, task timeouts, orphan recovery, transactional outbox with lease-based delivery, idempotent IM commands.
+- **Human approval gates** with interactive approve/reject buttons in Telegram and Feishu.
+- **Telegram + Feishu/Lark** share one domain control model: a task created in one IM is visible and controllable from the other.
+- **GitHub**: branch push, Draft PR (never auto-merges), CI status, CI-failure and PR-review ingestion feeding fix workflows.
+- **Security**: agent sandboxes (provider-native permission modes + OS-level write jail), secret isolation, permission profiles, audit log; observability with metrics, usage/duration tracking, and per-task budget caps.
 
 ## Prerequisites and installation
 
-- Node.js **22.13 or newer** (the implementation uses the built-in `node:sqlite` API)
+- Node.js **22.13 or newer** (uses the built-in `node:sqlite`)
 - Git **2.28 or newer**
-- npm
+- Optional: `claude` and/or `codex` CLI on PATH (agents to orchestrate), `gh` CLI authenticated (GitHub integration)
+- Optional (Linux only): `bubblewrap` for the OS-level sandbox — without it, sandbox profiles refuse to run rather than execute unsandboxed
 
 ```bash
 npm install
 npm run build
 ```
 
-## Database and migrations
-
-The CLI uses `.agentdock/agentdock.db` by default. Set `AGENTDOCK_DB` to use another SQLite file. The parent directory is created automatically, foreign keys are enabled on every connection, and pending migrations run whenever the application opens the database.
-
-To run migrations explicitly:
+## Quick start
 
 ```bash
-AGENTDOCK_DB=/absolute/path/agentdock.db npm run migrate
-```
+# 1. Register a project (verify command is optional but recommended)
+npm run cli -- project add --name api \
+  --repo-path /repos/api \
+  --worktree-root /worktrees/api \
+  --verify-command '["npm","test"]' \
+  --permission-profile default
 
-Migrations in `migrations/` are applied once in lexical order and recorded in `schema_migrations`. Keep applied migrations immutable; add a new numbered migration for schema changes.
-
-## Local CLI
-
-Commands compile the TypeScript application before execution. Output is JSON so it can be inspected or piped to other local tools.
-
-```bash
-# Create and list projects
-npm run cli -- project add --name api --repo-path /repos/api --worktree-root /worktrees/api --base-branch main
-npm run cli -- project list
-
-# Use the project ID returned above
+# 2. Create a task and its isolated worktree
 npm run cli -- task create --project-id <project-id> --request "Add health endpoint"
-npm run cli -- task list --project-id <project-id>
-npm run cli -- task show --task-id <task-id>
+npm run cli -- task prepare --task-id <task-id>
 
-# Preserve revision 1 and make revision 2 current
-npm run cli -- task revise --task-id <task-id> --request "Add readiness and liveness endpoints"
+# 3. Run a workflow and watch the steps
+npm run cli -- workflow start --task-id <task-id> --preset cross-review
+npm run cli -- workflow execute --run-id <run-id>
+npm run cli -- workflow status  --run-id <run-id>
 
-# Isolated worktrees (repo-path must be a Git work tree with the base branch)
-npm run cli -- project validate --project-id <project-id>
-npm run cli -- task prepare --task-id <task-id>   # creates <worktree-root>/<task-id> + branch agentdock/<task-id>
-npm run cli -- task status --task-id <task-id>    # branch, HEAD/base SHA, changed files
-npm run cli -- task diff --task-id <task-id> --stat
-npm run cli -- task cleanup --task-id <task-id>   # removes worktree + branch; --force also discards dirty worktrees and unmerged commits
-npm run cli -- project set-status --project-id <project-id> --status PAUSED   # ACTIVE|PAUSED|DISABLED
+# 4. After a SUCCEEDED task, deliver via GitHub
+npm run cli -- github create-pr --task-id <task-id> --title "Add health endpoint"
 ```
 
-`task prepare` is idempotent and recovers from a deleted worktree directory as long as the branch survives (Git is the source of truth). Tasks in PAUSED/DISABLED projects cannot be prepared.
+## Long-running service
 
-Use the same `AGENTDOCK_DB` value on later invocations to reopen and inspect persisted data.
+```bash
+TELEGRAM_BOT_TOKEN=... npm run cli -- serve
+```
+
+`serve` runs the full production stack: IM adapters (Telegram long-polling; Feishu webhook when `FEISHU_WEBHOOK_PORT` is set), the orchestrator (leases, concurrency, timeouts, crash recovery), and the outbox dispatcher (terminal run events notify the IM conversation that started the task).
+
+IM commands: `/projects`, `/use NAME`, `/new REQUEST`, `/run TASK PRESET`, `/tasks`, `/status TASK`, `/diff TASK`, `/stop TASK`, plus interactive approve/reject buttons at approval gates. Restrict access with `ALLOWED_CHAT_IDS` (Telegram) / `FEISHU_ALLOWED_CHAT_IDS` and verify Feishu webhooks with `FEISHU_VERIFICATION_TOKEN`.
+
+## Agent sandboxing
+
+Agents never run unsandboxed by default. Two layers, selected per project via `--permission-profile`:
+
+| Profile | Provider-native (layer 1) | OS write-jail (layer 2) |
+| --- | --- | --- |
+| `default` | claude `acceptEdits` + tool allowlist; codex `workspace-write` | seatbelt (macOS) / bwrap (Linux), fail-closed |
+| `restricted` / `sandboxed` | same, shorter step timeouts | same, fail-closed |
+| `full-access` | legacy dangerous flags | none — for externally isolated setups |
+
+The write jail confines agent writes to the task worktree plus agent config dirs; writes elsewhere are EPERM-denied. `full-access` exists only for projects that manage isolation themselves. Orchestrator secrets (tokens, keys) are stripped from agent environments regardless of profile.
+
+## Database
+
+Default: `.agentdock/agentdock.db`; override with `AGENTDOCK_DB`. Migrations in `migrations/` apply automatically on open (lexically ordered, recorded in `schema_migrations`) or explicitly via `npm run migrate`.
+
+## CLI reference
+
+`npm run cli -- --help` lists everything: project/task/workflow/github/metrics/audit subcommands. Highlights:
+
+```bash
+npm run cli -- workflow start --task-id ID --preset careful --provider REVIEW=codex --provider IMPLEMENT=claude
+npm run cli -- workflow approve --run-id ID [--reject]
+npm run cli -- github refresh --task-id ID      # poll PR/CI; failures auto-trigger fix runs under `serve`
+npm run cli -- metrics summary                 # step/task aggregates
+npm run cli -- metrics usage --task-id ID      # per-agent duration + tokens
+npm run cli -- audit --task-id ID              # who did what
+```
 
 ## Development
 
@@ -68,8 +97,4 @@ npm run typecheck
 npm test
 ```
 
-The core is split into domain-focused modules under `src/`. Services own operations such as atomically creating a Task and its initial TaskRevision; SQLite repositories encapsulate SQL. `src/git/` contains the `GitService` (execFile-based, argument arrays only, shell disabled) and the `WorktreeManager` that owns the branch/worktree lifecycle. Workflow, agent-thread, and artifact modules remain persistence abstractions until later milestones.
-
-## Intentionally deferred
-
-Coding-agent execution (Codex and Claude), process runners for agents, workflow execution, schedulers, Telegram, Feishu/Lark, GitHub integration, Redis, and a web dashboard belong to future roadmap milestones (agent runtime starts in V0.3).
+Architecture: domain services own operations; SQLite repositories encapsulate SQL; every external system (git, Telegram, Feishu, GitHub, agent CLIs) sits behind a port/adapter. All process execution uses argv arrays with shell disabled — IM/user text never reaches a shell. The orchestrator owns all workflow state; agents never control the global workflow.

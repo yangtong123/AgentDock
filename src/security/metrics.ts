@@ -32,23 +32,7 @@ export interface UsageRecord {
  * usage records agents report (token counts when the provider emits them).
  */
 export class MetricsService {
-  constructor(private readonly db: Database, private readonly now = () => new Date().toISOString()) {
-    this.db.exec(`CREATE TABLE IF NOT EXISTS agent_usage (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      task_id TEXT NOT NULL,
-      provider TEXT NOT NULL,
-      role TEXT NOT NULL,
-      duration_ms INTEGER NOT NULL,
-      input_tokens INTEGER,
-      output_tokens INTEGER,
-      created_at TEXT NOT NULL
-    )`);
-    this.db.exec(`CREATE TABLE IF NOT EXISTS step_durations (
-      step_run_id TEXT PRIMARY KEY,
-      duration_ms INTEGER NOT NULL,
-      created_at TEXT NOT NULL
-    )`);
-  }
+  constructor(private readonly db: Database, private readonly now = () => new Date().toISOString()) {}
 
   recordStepDuration(stepRunId: string, durationMs: number): void {
     this.db.prepare("INSERT INTO step_durations (step_run_id, duration_ms, created_at) VALUES (?,?,?) ON CONFLICT(step_run_id) DO UPDATE SET duration_ms = excluded.duration_ms")

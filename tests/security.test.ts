@@ -35,8 +35,9 @@ test("permission profiles define bounded step timeouts and network policy", () =
   const restricted = PROFILES["restricted"]!;
   const defaultProfile = PROFILES["default"]!;
   assert.ok(restricted.stepTimeoutMs < defaultProfile.stepTimeoutMs);
-  assert.equal(restricted.networkAccess, false);
-  assert.equal(defaultProfile.networkAccess, true);
+  assert.equal(restricted.osSandbox, "write-jail");
+  assert.equal(restricted.failClosed, true);
+  assert.equal(PROFILES["full-access"]!.osSandbox, "none");
 });
 
 test("AuditLog records and filters entries", () => {

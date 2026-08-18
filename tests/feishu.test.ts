@@ -7,6 +7,7 @@ import { openDatabase } from "../src/db/database.js";
 import { createApplication } from "../src/app/application.js";
 import { createRepository } from "./helpers.js";
 import { FeishuAdapter } from "../src/im/feishu-adapter.js";
+import { decodeCallback } from "../src/im/telegram-adapter.js";
 import { ImController } from "../src/im/im-controller.js";
 import type { ImAdapter, ImMessage, ImReply } from "../src/im/im-adapter.js";
 
@@ -62,17 +63,24 @@ test("FeishuAdapter card actions reuse the Telegram compact action payloads", as
     const actions: string[] = [];
     adapter.onAction(async (command) => { actions.push(command.type); });
     const runId = "12345678-1234-1234-1234-123456789012";
+    // Real event-subscription shape: no event.message; chat id in event.context.
     await adapter.processEvent({
       header: { event_type: "card.action.trigger" },
-      event: { message: { chat_id: "oc-1" }, action: { value: { payload: `ar:${runId}:1` } } },
+      event: { context: { open_chat_id: "oc-1" }, action: { value: { payload: `ar:${runId}:1` } } },
     });
     assert.deepEqual(actions, ["APPROVE_RUN"]);
+    // Legacy card-callback shape: open_chat_id and action at the top level.
+    await adapter.processEvent({
+      open_chat_id: "oc-1",
+      action: { value: { payload: `ar:${runId}:0` } },
+    });
+    assert.equal(actions.length, 2, "legacy card callbacks are handled too");
     // Garbage payloads are dropped.
     await adapter.processEvent({
       header: { event_type: "card.action.trigger" },
-      event: { message: { chat_id: "oc-1" }, action: { value: { payload: "junk" } } },
+      event: { context: { open_chat_id: "oc-1" }, action: { value: { payload: "junk" } } },
     });
-    assert.equal(actions.length, 1);
+    assert.equal(actions.length, 2);
   });
 });
 
@@ -91,6 +99,33 @@ test("FeishuAdapter send() posts through the open API with the tenant token", as
   const silent = new FeishuAdapter(0, fetchImpl, null, () => null);
   await silent.send({ conversationId: "oc-1", text: "hello" });
   assert.equal(calls.length, 1);
+});
+
+test("FeishuAdapter send() renders actions as an interactive card with decodable payloads", async () => {
+  const calls: unknown[] = [];
+  const fetchImpl = (async (_url: string, init?: RequestInit) => {
+    calls.push(JSON.parse(String(init?.body)));
+    return new Response("{}", { status: 200 });
+  }) as unknown as typeof fetch;
+  const adapter = new FeishuAdapter(0, fetchImpl, null, () => "tenant-token");
+  const runId = "12345678-1234-1234-1234-123456789012";
+  await adapter.send({
+    conversationId: "oc-1",
+    text: "paused for approval",
+    actions: [
+      { label: "Approve", command: { type: "APPROVE_RUN", conversationId: "oc-1", runId, approved: true } },
+      { label: "Reject", command: { type: "APPROVE_RUN", conversationId: "oc-1", runId, approved: false } },
+    ],
+  });
+  const body = calls[0] as { msg_type: string; content: string };
+  assert.equal(body.msg_type, "interactive", "approval gates must be actionable from Feishu");
+  const card = JSON.parse(body.content) as { elements: { tag: string; actions?: { value: { payload: string } }[] }[] };
+  const payloads = card.elements.find((e) => e.tag === "action")!.actions!.map((a) => a.value.payload);
+  assert.equal(payloads.length, 2);
+  const approve = decodeCallback(payloads[0]!, "oc-1");
+  assert.deepEqual(approve, { type: "APPROVE_RUN", conversationId: "oc-1", runId, approved: true });
+  const reject = decodeCallback(payloads[1]!, "oc-1");
+  assert.deepEqual(reject, { type: "APPROVE_RUN", conversationId: "oc-1", runId, approved: false });
 });
 
 function fakeAdapter(name: string): ImAdapter & { delivered: ImReply[]; deliverMessage: (message: ImMessage) => Promise<void> } {

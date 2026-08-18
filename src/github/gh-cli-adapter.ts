@@ -8,13 +8,14 @@ type GhPr = {
   number: number; url: string; state: string; isDraft: boolean; title: string; headRefName: string;
 };
 
-/** gh pr checks --json fields: name, state (e.g. "pass"/"fail"/"pending"), bucket. */
+/** gh pr checks --json fields: name, state (API-style SUCCESS/PENDING/FAILURE), bucket (rollup: pass/fail/pending). */
 type GhCheckRun = { name: string; state: string; bucket: string };
 
 type GhReview = { id?: number | string; author: { login: string } | null; state: string; body: string | null };
 
-const STATE_TO_STATUS: Record<string, CheckRun["status"]> = {
-  pass: "COMPLETED", fail: "COMPLETED", skipping: "COMPLETED", canceled: "COMPLETED",
+/** The rollup `bucket` is authoritative: `state` strings are API-style and vary across gh versions. */
+const BUCKET_TO_STATUS: Record<string, CheckRun["status"]> = {
+  pass: "COMPLETED", fail: "COMPLETED", skipping: "COMPLETED", cancel: "COMPLETED", canceled: "COMPLETED",
   pending: "IN_PROGRESS",
 };
 
@@ -76,8 +77,8 @@ export class GhCliAdapter implements GitHubPort {
     const rows = JSON.parse(json) as GhCheckRun[];
     const checkRuns: CheckRun[] = rows.map((row) => ({
       name: row.name,
-      status: STATE_TO_STATUS[row.state] ?? "UNKNOWN",
-      conclusion: row.state === "pass" ? "SUCCESS" : row.state === "fail" ? "FAILURE" : null,
+      status: BUCKET_TO_STATUS[row.bucket] ?? "UNKNOWN",
+      conclusion: row.bucket === "pass" ? "SUCCESS" : row.bucket === "fail" ? "FAILURE" : null,
     }));
     const aggregate = checkRuns.some((run) => run.status !== "COMPLETED")
       ? "PENDING"

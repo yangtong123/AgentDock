@@ -163,6 +163,27 @@ test("PR review ingestion: CHANGES_REQUESTED triggers a fix once; repeats dedupl
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test("GhCliAdapter.ciStatus maps the rollup bucket, not the API-style state", async () => {
+  const adapter = new GhCliAdapter("echo-gh");
+  (adapter as unknown as Record<string, unknown>).run = async () => JSON.stringify([
+    // Real gh output shape: state is API-style, bucket is the rollup.
+    { name: "test (ubuntu-latest)", state: "SUCCESS", bucket: "pass" },
+    { name: "test (macos-latest)", state: "SUCCESS", bucket: "pass" },
+  ]);
+  assert.equal((await adapter.ciStatus("/repo", 3)).aggregate, "PASSING");
+  (adapter as unknown as Record<string, unknown>).run = async () => JSON.stringify([
+    { name: "build", state: "FAILURE", bucket: "fail" },
+    { name: "lint", state: "SUCCESS", bucket: "pass" },
+  ]);
+  const failing = await adapter.ciStatus("/repo", 4);
+  assert.equal(failing.aggregate, "FAILING");
+  assert.equal(failing.checkRuns[0]!.conclusion, "FAILURE");
+  (adapter as unknown as Record<string, unknown>).run = async () => JSON.stringify([
+    { name: "build", state: "PENDING", bucket: "pending" },
+  ]);
+  assert.equal((await adapter.ciStatus("/repo", 5)).aggregate, "PENDING");
+});
+
 test("GhCliAdapter builds argv-only gh/git invocations (no shell)", async () => {
   const calls: string[][] = [];
   const gitCalls: string[][] = [];
@@ -187,8 +208,7 @@ test("GhCliAdapter builds argv-only gh/git invocations (no shell)", async () => 
   assert.equal(create[create.indexOf("--title") + 1], "t; rm -rf /");
   void recording;
   await adapter.ciStatus("/repo", 7);
-  assert.deepEqual(calls.at(-1)!.slice(0, 3), ["pr", "checks", "7"]);
-  await adapter.findPrForBranch("/repo", "agentdock/t1");
+  assert.deepEqual(calls.at(-1)!.slice(0, 3), ["pr", "checks", "7"]);  await adapter.findPrForBranch("/repo", "agentdock/t1");
   const list = calls.find((args) => args[0] === "pr" && args[1] === "list")!;
   assert.equal(list.includes("--state"), true);
   assert.equal(list[list.indexOf("--state") + 1], "all");

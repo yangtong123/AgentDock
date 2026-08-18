@@ -19,16 +19,17 @@ export interface PermissionProfile {
    * Note: there is deliberately no networkAccess flag — neither Seatbelt nor
    * bwrap can distinguish the agent CLI's own model-API traffic from its
    * children's traffic, so a network deny would break the agent entirely.
-   * Network restriction is the provider sandbox's job (codex workspace-write
-   * defaults to localhost-only for children; claude denies WebFetch/WebSearch
-   * via --disallowedTools).
+   * claude additionally denies WebFetch/WebSearch via --disallowedTools.
    */
   extraReadPaths: string[];
   /**
    * Provider-native permission mode (layer 1): the agent CLI polices its own
-   * tools. "provider-sandboxed" maps to codex -s workspace-write and
-   * claude --permission-mode acceptEdits + a conservative tool allowlist.
-   * "full-access" keeps the old dangerous flags for projects that opt in.
+   * tools. "provider-sandboxed" maps to claude --permission-mode acceptEdits
+   * + a conservative tool allowlist; codex runs with its own sandbox OFF when
+   * a fail-closed OS jail is active, because the inner seatbelt cannot nest
+   * inside the outer one on macOS (it falls back to -s workspace-write only
+   * when no OS jail is enforced). "full-access" keeps the old dangerous
+   * flags for projects that opt in.
    */
   providerMode: "provider-sandboxed" | "full-access";
   /**

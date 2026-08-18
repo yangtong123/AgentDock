@@ -40,14 +40,16 @@ test("layer 1: claude uses permission mode + tool allowlist unless full-access",
   assert.equal(argv().includes("--dangerously-skip-permissions"), true, "explicit full-access opt-in keeps the old flag");
 });
 
-test("layer 1: codex uses workspace-write sandbox unless full-access", async () => {
+test("layer 1: codex relies on the OS jail when one is enforced (inner sandbox cannot nest)", async () => {
   const { runner, argv, env } = spyRunner();
   const codex = new CodexAgent(runner);
   await codex.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {}, profile: PROFILES["default"]! });
   const args = argv();
   assert.equal(args.includes("--dangerously-bypass-approvals-and-sandbox"), false, "dangerous flag must be gone");
-  assert.equal(args[args.indexOf("-s") + 1], "workspace-write");
-  assert.match(args.join(" "), /sandbox_workspace_write\.network_access/);
+  // macOS denies codex's inner sandbox_apply under the outer Seatbelt jail;
+  // with layer 2 enforced (fail-closed), codex's own sandbox stays off.
+  assert.equal(args[args.indexOf("-s") + 1], "danger-full-access");
+  assert.equal(args.includes("sandbox_workspace_write.network_access=true"), false);
   // TLS roots come from a file bundle: rustls must not need macOS trustd/
   // securityd XPC, keeping the Seatbelt profile free of broker access. The
   // bundle path is platform-dependent — assert whatever the resolver selects.
@@ -109,6 +111,12 @@ test("layer 2: seatbelt profile denies writes outside allowlisted paths", () => 
   // give a compromised agent XPC access to credential-adjacent services. Codex
   // gets TLS roots via SSL_CERT_FILE instead (see CodexAgent).
   assert.equal(sbProfile.includes("mach-lookup"), false, "seatbelt must not grant mach-lookup to system brokers");
+  // Codex's config.toml stays read-only (no planting MCP servers/settings for
+  // future runs). SBPL: later rules win, so the deny must follow the allows.
+  const denyIndex = sbProfile.indexOf('(deny file-write* (literal');
+  const lastAllowIndex = sbProfile.lastIndexOf("(allow file-write* (subpath");
+  assert.ok(denyIndex > lastAllowIndex && denyIndex > 0, "config.toml deny must come after the write allows");
+  assert.match(sbProfile, /\.codex\/config\.toml/);
 });
 
 test("layer 2: plan() resolves write-jail per platform and fails closed when unenforceable", () => {

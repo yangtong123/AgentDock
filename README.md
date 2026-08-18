@@ -73,7 +73,7 @@ Agents never run unsandboxed by default. Two layers, selected per project via `-
 
 | Profile | Provider-native (layer 1) | OS write-jail (layer 2) |
 | --- | --- | --- |
-| `default` | claude `acceptEdits` + tool allowlist; codex `workspace-write` | seatbelt (macOS) / bwrap (Linux), fail-closed |
+| `default` | claude `acceptEdits` + tool allowlist; codex: off (its sandbox cannot nest under the OS jail) | seatbelt (macOS) / bwrap (Linux), fail-closed |
 | `restricted` / `sandboxed` | same, shorter step timeouts | same, fail-closed |
 | `full-access` | legacy dangerous flags | none — for externally isolated setups |
 

@@ -74,14 +74,18 @@ function claudePermissionArgs(profile: AgentRunContext["profile"]): string[] {
 }
 
 /**
- * Codex's own sandbox (layer 1): workspace-write confines writes to the
- * worktree. network_access must stay true — it gates the Codex process's own
- * API traffic too, so false breaks the model call entirely; agent-child
- * network denial is enforced by the OS sandbox (layer 2) instead.
+ * Codex's own sandbox (layer 1) cannot nest inside the OS write-jail (layer
+ * 2): macOS denies the inner sandbox_apply, and codex then rejects every
+ * filesystem operation — including worktree writes. So when layer 2 is
+ * enforced (any write-jail profile, fail-closed by design), codex runs with
+ * its provider-native sandbox off and layer 2 alone confines writes to the
+ * worktree. The network flag from the workspace-write mode is unnecessary
+ * for the same reason: codex's own API traffic needs the network anyway.
  */
 function codexSandboxArgs(profile: AgentRunContext["profile"]): string[] {
   if (profile.providerMode === "full-access") return ["--dangerously-bypass-approvals-and-sandbox"];
-  // exec mode is non-interactive: with -s workspace-write, approvals are auto-handled within the sandbox.
+  if (profile.osSandbox !== "none" && profile.failClosed) return ["-s", "danger-full-access"];
+  // No enforced OS jail (custom/degraded profile): fall back to codex's own workspace-write.
   return ["-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true"];
 }
 

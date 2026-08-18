@@ -51,12 +51,15 @@ export class OsSandbox {
   }
 
   /**
-   * Seatbelt profile: writes confined to the worktree, agent config/cache dirs
-   * (~/.claude, ~/.codex), and tmp. Everything else is read-only. Network is
-   * NOT denied here: the agent CLI's own model-API traffic would break, and
-   * Seatbelt cannot distinguish it from child-process traffic. Paths are
-   * realpath-normalized because Seatbelt matches literal prefixes — /tmp vs
-   * /private/tmp mismatches would silently deny legitimate writes.
+   * Seatbelt profile: writes confined to the worktree, tmp, and the agent
+   * CLIs' own state dirs (~/.claude, ~/.codex) — minus codex's config.toml,
+   * which stays read-only so a compromised agent cannot plant MCP servers or
+   * model settings that would persist into future runs (Seatbelt denies win
+   * over allows). Network is NOT denied here: the agent CLI's own model-API
+   * traffic would break, and Seatbelt cannot distinguish it from
+   * child-process traffic. Paths are realpath-normalized because Seatbelt
+   * matches literal prefixes — /tmp vs /private/tmp mismatches would
+   * silently deny legitimate writes.
    *
    * Deliberately no mach-lookup allowances: macOS system brokers (trustd,
    * securityd/SecurityServer, configd, ...) would give a compromised agent
@@ -68,11 +71,10 @@ export class OsSandbox {
     const home = process.env.HOME ?? "/Users/unknown";
     const writePaths = [
       worktreePath,
-      `${home}/.claude`,
-      `${home}/.codex`,
-      `${home}/.config`,
       "/private/tmp",
       "/tmp",
+      `${home}/.claude`,
+      `${home}/.codex`,
       ...(profile.extraReadPaths ?? []),
     ].map((path) => this.normalize(path));
     const writeRules = writePaths.map((path) => `  (allow file-write* (subpath "${this.escape(path)}"))`).join("\n");
@@ -84,6 +86,8 @@ export class OsSandbox {
 (allow file-read*)
 (allow network*)
 ${writeRules}
+  ;; SBPL: later rules win — the config-file deny must come after the allows.
+  (deny file-write* (literal "${this.escape(this.normalize(`${home}/.codex/config.toml`))}"))
 `;
   }
 

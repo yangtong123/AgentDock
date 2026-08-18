@@ -37,6 +37,16 @@ export class GhCliAdapter implements GitHubPort {
     await execFileAsync(this.gitBinary, ["push", "-u", "origin", headBranch], { cwd: repoPath, shell: false });
   }
 
+  async commitAll(repoPath: string, message: string): Promise<boolean> {
+    await execFileAsync(this.gitBinary, ["add", "-A"], { cwd: repoPath, shell: false });
+    const { stdout } = await execFileAsync(this.gitBinary, ["status", "--porcelain"], { cwd: repoPath, shell: false });
+    if (stdout.trim() === "") return false;
+    // Explicit identity: automation-authored commits stay visible as such and
+    // never depend on the host's git config.
+    await execFileAsync(this.gitBinary, ["-c", "user.name=agentdock", "-c", "user.email=agentdock@localhost", "commit", "-m", message], { cwd: repoPath, shell: false });
+    return true;
+  }
+
   async createDraftPr(repoPath: string, input: CreateDraftPrInput): Promise<PullRequest> {
     const output = await this.run(["pr", "create", "--draft", "--title", input.title, "--body", input.body, "--head", input.headBranch, "--base", input.baseBranch], repoPath);
     const number = Number(output.trim().match(/\/pull\/(\d+)/)?.[1] ?? 0);

@@ -11,12 +11,14 @@ import { GitHubService } from "../src/github/github-service.js";
 import { GhCliAdapter } from "../src/github/gh-cli-adapter.js";
 import type { CiStatus, CreateDraftPrInput, GitHubPort, PrReview, PullRequest } from "../src/github/github-port.js";
 
-function fakeGithub(behavior: { prNumber?: number; ciAggregate?: CiStatus["aggregate"]; reviews?: PrReview[] } = {}): GitHubPort & { pushes: { repoPath: string; branch: string }[]; createdPrs: CreateDraftPrInput[] } {
+function fakeGithub(behavior: { prNumber?: number; ciAggregate?: CiStatus["aggregate"]; reviews?: PrReview[] } = {}): GitHubPort & { pushes: { repoPath: string; branch: string }[]; createdPrs: CreateDraftPrInput[]; calls: string[] } {
   const pushes: { repoPath: string; branch: string }[] = [];
   const createdPrs: CreateDraftPrInput[] = [];
+  const calls: string[] = [];
   return {
-    pushes, createdPrs,
-    async pushBranch(repoPath, branch) { pushes.push({ repoPath, branch }); },
+    pushes, createdPrs, calls,
+    async pushBranch(repoPath, branch) { calls.push("push"); pushes.push({ repoPath, branch }); },
+    async commitAll() { calls.push("commit"); return true; },
     async createDraftPr(repoPath, input) { createdPrs.push(input); return { number: behavior.prNumber ?? 42, url: `https://example/pull/${behavior.prNumber ?? 42}`, state: "OPEN", isDraft: true, title: input.title, headRefName: input.headBranch }; },
     async findPrForBranch() { return { number: behavior.prNumber ?? 42, url: "https://example/pull/42", state: "OPEN", isDraft: false, title: "t", headRefName: "h" }; },
     async ciStatus(): Promise<CiStatus> {
@@ -64,11 +66,42 @@ test("createDraftPr pushes the branch and records the draft PR", async () => {
     assert.equal(record.isDraft, true);
     assert.equal(f.github.pushes.length, 1);
     assert.equal(f.github.pushes[0]!.branch.startsWith("agentdock/"), true);
+    assert.deepEqual(f.github.calls.slice(0, 2), ["commit", "push"], "delivery commits the worktree diff before pushing");
     assert.equal(f.github.createdPrs[0]!.title, "Add feature");
     assert.equal(f.service.recordFor(taskId)!.prUrl, "https://example/pull/42");
     // Duplicate PR is refused.
     await assert.rejects(f.service.createDraftPr({ taskId, title: "again" }), /already has PR/);
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("deliverChanges commits and pushes to the existing PR, and is a no-op without one", async () => {
+  const f = fixture();
+  try {
+    const taskId = await succeededTask(f);
+    // No PR yet: nothing to deliver to.
+    assert.deepEqual(await f.service.deliverChanges(taskId), { committed: false, pushed: false, prNumber: null });
+    assert.equal(f.github.calls.length, 0);
+    await f.service.createDraftPr({ taskId, title: "Add feature" });
+    f.github.calls.length = 0;
+    const result = await f.service.deliverChanges(taskId);
+    assert.deepEqual(result, { committed: true, pushed: true, prNumber: 42 });
+    assert.deepEqual(f.github.calls, ["commit", "push"], "fix delivery commits then pushes, never opens another PR");
+    assert.equal(f.github.createdPrs.length, 1);
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("GhCliAdapter.commitAll commits a dirty worktree and no-ops a clean one", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agentdock-gh-commit-"));
+  createRepository(join(base, "repo"));
+  const adapter = new GhCliAdapter();
+  try {
+    assert.equal(await adapter.commitAll(join(base, "repo"), "noop"), false, "clean worktree: no commit");
+    writeFileSync(join(base, "repo", "change.txt"), "x\n");
+    assert.equal(await adapter.commitAll(join(base, "repo"), "deliver change"), true);
+    const log = execFileSync("git", ["log", "-1", "--format=%an %s"], { cwd: join(base, "repo") }).toString().trim();
+    assert.equal(log, "agentdock deliver change", "explicit automation identity");
+    assert.equal(await adapter.commitAll(join(base, "repo"), "noop"), false, "clean again after the commit");
+  } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
 test("createDraftPr refuses non-succeeded tasks", async () => {

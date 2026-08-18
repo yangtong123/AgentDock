@@ -356,6 +356,16 @@ export class Orchestrator {
     for (const row of rows) {
       if (row.state === "SUCCEEDED") {
         this.app.github.clearConsumedTriggers(row.runId);
+        // A successful fix run must reach the PR (commit + push) or the remote
+        // branch never updates and CI never re-runs. Fire-and-forget: delivery
+        // is git/gh I/O; failures surface as outbox events, not reap failures.
+        const taskRow = this.db.prepare("SELECT rev.task_id AS taskId FROM workflow_runs r JOIN task_revisions rev ON r.task_revision_id = rev.id WHERE r.id = ?").get(row.runId) as { taskId: string } | undefined;
+        if (taskRow !== undefined) {
+          const taskId = taskRow.taskId;
+          void this.app.github.deliverChanges(taskId)
+            .then((result) => { if (result.pushed) this.outbox.publish({ taskId, type: "fix.delivered", payload: result }); })
+            .catch((error) => this.outbox.publish({ taskId, type: "fix.deliver-failed", payload: { taskId, message: error instanceof Error ? error.message : String(error) } }));
+        }
       } else if (row.state === "FAILED" || row.state === "CANCELLED") {
         this.db.prepare("UPDATE github_fix_events SET consumed_by_run = NULL WHERE consumed_by_run = ?").run(row.runId);
       }

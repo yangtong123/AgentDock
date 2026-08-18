@@ -34,7 +34,11 @@ export class GitHubService {
   ) {
   }
 
-  /** Commits nothing: AgentDock pushes the task branch as-is and opens a Draft PR. */
+  /**
+   * Commits the worktree diff (agents are told not to commit), pushes the
+   * task branch, and opens a Draft PR. A clean worktree is fine: the branch
+   * may still be ahead of base from earlier commits.
+   */
   async createDraftPr(input: PrCreationInput): Promise<PrRecord> {
     const task = this.tasks.findById(input.taskId);
     if (!task) throw new NotFoundError(`Task ${input.taskId} not found`);
@@ -45,6 +49,11 @@ export class GitHubService {
 
     const project = this.projects.findById(task.projectId);
     if (!project) throw new NotFoundError(`Project ${task.projectId} not found`);
+    // Agents are instructed not to commit; delivery commits the worktree diff
+    // first, or the pushed branch has no commits and the PR is empty. A false
+    // (clean worktree) is not an error: the branch may already be ahead of
+    // base from earlier commits.
+    await this.github.commitAll(task.worktreePath, `AgentDock task ${task.id}: ${input.title}`);
     // Push from the task worktree: the worktree's branch is the head.
     await this.github.pushBranch(task.worktreePath, task.branch);
     const pr = await this.github.createDraftPr(project.repoPath, {
@@ -58,6 +67,22 @@ export class GitHubService {
     this.db.prepare("INSERT INTO pull_requests (id,task_id,pr_number,pr_url,head_branch,base_branch,state,is_draft,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
       .run(record.id, record.taskId, record.prNumber, record.prUrl, record.headBranch, record.baseBranch, record.state, record.isDraft ? 1 : 0, record.createdAt, record.updatedAt);
     return record;
+  }
+
+  /**
+   * Delivers a fix run's result to the existing PR: commit the worktree diff
+   * and push the head branch, so CI re-runs on the updated PR. No-op when the
+   * task has no PR. Returns what happened for audit/events.
+   */
+  async deliverChanges(taskId: string): Promise<{ committed: boolean; pushed: boolean; prNumber: number | null }> {
+    const record = this.recordFor(taskId);
+    if (record === null) return { committed: false, pushed: false, prNumber: null };
+    const task = this.tasks.findById(taskId);
+    if (!task || !task.worktreePath || !task.branch) return { committed: false, pushed: false, prNumber: record.prNumber };
+    const committed = await this.github.commitAll(task.worktreePath, `AgentDock fix for PR #${record.prNumber}`);
+    // Push even when clean: earlier commits may not have reached the remote.
+    await this.github.pushBranch(task.worktreePath, task.branch);
+    return { committed, pushed: true, prNumber: record.prNumber };
   }
 
   recordFor(taskId: string): PrRecord | null {

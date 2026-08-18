@@ -38,6 +38,12 @@ export interface CreateDraftPrInput {
 export interface GitHubPort {
   /** Pushes headBranch from the repository at repoPath to origin. */
   pushBranch(repoPath: string, headBranch: string): Promise<void>;
+  /**
+   * Commits every pending change in the worktree (agents are told not to
+   * commit, so delivery owns this step). Returns false when the worktree was
+   * already clean — a PR over zero new commits is pointless.
+   */
+  commitAll(repoPath: string, message: string): Promise<boolean>;
   createDraftPr(repoPath: string, input: CreateDraftPrInput): Promise<PullRequest>;
   findPrForBranch(repoPath: string, headBranch: string): Promise<PullRequest | null>;
   ciStatus(repoPath: string, prNumber: number): Promise<CiStatus>;

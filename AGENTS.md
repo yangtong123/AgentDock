@@ -25,10 +25,8 @@ AgentDock is a multi-project coding-agent orchestrator. It coordinates coding ag
 - Keep domain logic independent from Telegram, Feishu, GitHub, Codex CLI, and Claude Code CLI implementations.
 - Prefer ports/adapters around external systems.
 
-## Current milestone
+## Current status
 
-The current implementation target is **V0.2 — Multi-project + Git Worktree**.
+All roadmap milestones through **V1.0 — Stable Daily Driver** are implemented (see `docs/ROADMAP.md`). The project is in V1.0 stabilization and release wrap-up: bug fixes, CI, end-to-end acceptance, and the release checklist.
 
-V0.1 (core foundation) is complete. V0.2 adds GitService, WorktreeManager, branch/worktree lifecycle, git status/diff, and cleanup.
-
-Do not implement V0.3+ functionality (agent runtime, workflow execution) in V0.2.
+Post-V1.0 features (web dashboard, additional IM adapters, multi-machine workers, etc.) are out of scope until real-world usage feedback justifies them.

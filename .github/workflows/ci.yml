@@ -7,6 +7,7 @@ on:
 
 jobs:
   test:
+    timeout-minutes: 20
     strategy:
       matrix:
         # ubuntu: full suite. macos: also exercises the Seatbelt sandbox
@@ -25,11 +26,13 @@ jobs:
       # write jail needs bubblewrap or the agent argv tests cannot run. Ubuntu
       # restricts unprivileged user namespaces via AppArmor, which is exactly
       # what bwrap needs — enable them, then smoke-test real namespace creation.
+      # needrestart can block apt interactively; keep it fully non-interactive.
       - if: runner.os == 'Linux'
         run: |
-          sudo apt-get update && sudo apt-get install -y bubblewrap
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y bubblewrap
           sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0 || true
-          bwrap --ro-bind / / -- /bin/true
+          timeout 30 bwrap --ro-bind / / -- /bin/true
 
       - run: npm ci
 

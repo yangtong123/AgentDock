@@ -54,12 +54,18 @@ npm run cli -- github create-pr --task-id <task-id> --title "Add health endpoint
 ## Long-running service
 
 ```bash
-TELEGRAM_BOT_TOKEN=... npm run cli -- serve
+FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx npm run cli -- serve
+# or: TELEGRAM_BOT_TOKEN=... npm run cli -- serve
 ```
 
-`serve` runs the full production stack: IM adapters (Telegram long-polling; Feishu webhook when `FEISHU_WEBHOOK_PORT` is set), the orchestrator (leases, concurrency, timeouts, crash recovery), and the outbox dispatcher (terminal run events notify the IM conversation that started the task).
+`serve` runs the full production stack: IM adapters, the orchestrator (leases, concurrency, timeouts, crash recovery), and the outbox dispatcher (terminal run events notify the IM conversation that started the task).
 
-IM commands: `/projects`, `/use NAME`, `/new REQUEST`, `/run TASK PRESET`, `/tasks`, `/status TASK`, `/diff TASK`, `/stop TASK`, plus interactive approve/reject buttons at approval gates. Restrict access with `ALLOWED_CHAT_IDS` (Telegram) / `FEISHU_ALLOWED_CHAT_IDS` and verify Feishu webhooks with `FEISHU_VERIFICATION_TOKEN`.
+Feishu has two transports; the long-connection one is the simple mode (no public URL, tunnel, or verification token, and the SDK renews `tenant_access_token` itself):
+
+- **Long connection (recommended)**: set `FEISHU_APP_ID` + `FEISHU_APP_SECRET`. In the developer console enable the bot capability, grant `im:message` + `im:message:send_as_bot`, subscribe `im.message.receive_v1`, select **long connection (长连接)** as the delivery mode, and publish the app. Note: the SDK's long connection does not deliver card callbacks, so approval prompts arrive as text — reply `/approve RUN_ID` or `/reject RUN_ID`.
+- **Webhook**: set `FEISHU_WEBHOOK_PORT` (plus `FEISHU_VERIFICATION_TOKEN` and `FEISHU_TENANT_TOKEN`) and point the event subscription URL and the card callback URL (回调配置 → 卡片回传交互) at the server. The webhook transport renders interactive approve/reject cards; also subscribe `card.action.trigger`.
+
+IM commands: `/projects`, `/use NAME`, `/new REQUEST`, `/run TASK PRESET`, `/tasks`, `/status TASK`, `/diff TASK`, `/stop TASK`, `/approve RUN_ID`, `/reject RUN_ID`, plus interactive approve/reject buttons at approval gates (Telegram and Feishu webhook). Restrict access with `ALLOWED_CHAT_IDS` (Telegram) / `FEISHU_ALLOWED_CHAT_IDS` and verify Feishu webhooks with `FEISHU_VERIFICATION_TOKEN`.
 
 ## Agent sandboxing
 

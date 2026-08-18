@@ -38,6 +38,16 @@ export function parseCommand(conversationId: string, text: string): ImCommand | 
     case "/stop":
       if (!argument) return null;
       return { type: "STOP_TASK", conversationId, taskId: argument };
+    case "/approve": {
+      const runId = rest[0] ?? "";
+      if (!runId) return null;
+      return { type: "APPROVE_RUN", conversationId, runId, approved: true };
+    }
+    case "/reject": {
+      const runId = rest[0] ?? "";
+      if (!runId) return null;
+      return { type: "APPROVE_RUN", conversationId, runId, approved: false };
+    }
     case "/diff": {
       if (!argument) return null;
       const parts = rest.filter((part) => part !== "--stat");

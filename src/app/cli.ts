@@ -7,6 +7,7 @@ import type { StepType } from "../shared/domain.js";
 import { ImController } from "../im/im-controller.js";
 import { TelegramAdapter } from "../im/telegram-adapter.js";
 import { FeishuAdapter } from "../im/feishu-adapter.js";
+import { FeishuWsAdapter } from "../im/feishu-ws-adapter.js";
 import { GitHubService } from "../github/github-service.js";
 import { GhCliAdapter } from "../github/gh-cli-adapter.js";
 import { Orchestrator } from "../reliability/orchestrator.js";
@@ -66,10 +67,17 @@ try {
   const app=createApplication(db); const [resource,action]=args;
   if(resource==="serve") {
     const telegramToken=process.env.TELEGRAM_BOT_TOKEN;
+    const feishuAppId=process.env.FEISHU_APP_ID;
+    const feishuAppSecret=process.env.FEISHU_APP_SECRET;
     const feishuPort=Number(process.env.FEISHU_WEBHOOK_PORT??0);
     const controller=new ImController(db,app);
     if(telegramToken) controller.register(new TelegramAdapter(telegramToken));
-    if(feishuPort>0) controller.register(new FeishuAdapter(feishuPort,undefined,process.env.FEISHU_VERIFICATION_TOKEN??null,()=>process.env.FEISHU_TENANT_TOKEN??null));
+    // Feishu: long connection (App ID + Secret, no public URL needed) is the
+    // simple mode; the webhook transport remains for setups that prefer it.
+    let feishuMode: string | null = null;
+    if(feishuAppId && feishuAppSecret) { controller.register(new FeishuWsAdapter(feishuAppId, feishuAppSecret)); feishuMode = "feishu(ws)"; }
+    else if(feishuPort>0) { controller.register(new FeishuAdapter(feishuPort,undefined,process.env.FEISHU_VERIFICATION_TOKEN??null,()=>process.env.FEISHU_TENANT_TOKEN??null)); feishuMode = "feishu(webhook)"; }
+    if((feishuAppId===undefined)!==(feishuAppSecret===undefined)) console.error("Warning: FEISHU_APP_ID and FEISHU_APP_SECRET must be set together; falling back.");
     // The orchestrator owns execution: leases, concurrency, timeouts, recovery.
     const orchestrator=new Orchestrator(db,app,app.processRunner,{});
     controller.attachOrchestrator(orchestrator);
@@ -79,7 +87,7 @@ try {
     await controller.startAll();
     await orchestrator.start();
     await dispatcher.start();
-    const adapters=[telegramToken?"telegram":null,feishuPort>0?"feishu":null].filter(Boolean).join("+")||"no IM adapters configured";
+    const adapters=[telegramToken?"telegram":null,feishuMode].filter(Boolean).join("+")||"no IM adapters configured";
     console.log(`AgentDock serving (${adapters}). Ctrl-C to stop.`);
     const shutdown=async()=>{ await dispatcher.stop(); await orchestrator.stop(); await controller.stopAll(); db.close(); process.exit(0); };
     process.on("SIGINT",()=>{ void shutdown(); });

@@ -8,16 +8,50 @@ type MessageHandler = (message: ImMessage) => Promise<void>;
 type ActionHandler = (command: ImCommand) => Promise<void>;
 
 interface FeishuEvent {
-  header?: { event_type?: string };
+  header?: { event_type?: string } | undefined;
   /** Legacy card-callback envelope (消息卡片请求网址): chat id and action at top level. */
-  open_chat_id?: string;
-  action?: { value?: Record<string, string> };
+  open_chat_id?: string | undefined;
+  action?: { value?: Record<string, string> } | undefined;
   event?: {
-    sender?: { sender_id?: { open_id?: string } };
+    sender?: { sender_id?: { open_id?: string } } | undefined;
     /** Event-subscription card callbacks carry the chat id here (no message object). */
-    context?: { open_chat_id?: string };
-    message?: { chat_id?: string; message_type?: string; content?: string };
-    action?: { value?: Record<string, string> };
+    context?: { open_chat_id?: string } | undefined;
+    message?: { chat_id?: string; message_type?: string; content?: string } | undefined;
+    action?: { value?: Record<string, string> } | undefined;
+  } | undefined;
+}
+
+/**
+ * Builds the im/v1/messages request body for a reply. Action-bearing replies
+ * become an interactive card: approval gates must be approvable from Feishu,
+ * not just from Telegram. Button values carry the same compact payloads the
+ * inbound card.action.trigger handler decodes. Shared by the webhook and
+ * long-connection transports.
+ */
+export function feishuMessageBody(reply: ImReply): { receive_id: string; msg_type: string; content: string } {
+  const buttons = (reply.actions ?? [])
+    .map((action) => ({ label: action.label, payload: encodeCallback(action.command) }))
+    .filter((button): button is { label: string; payload: string } => button.payload !== null);
+  if (buttons.length === 0) return { receive_id: reply.conversationId, msg_type: "text", content: JSON.stringify({ text: reply.text }) };
+  return {
+    receive_id: reply.conversationId,
+    msg_type: "interactive",
+    content: JSON.stringify({
+      config: { wide_screen_mode: true },
+      header: { title: { tag: "plain_text", content: "AgentDock" }, template: "blue" },
+      elements: [
+        { tag: "div", text: { tag: "lark_md", content: reply.text } },
+        {
+          tag: "action",
+          actions: buttons.map((button, index) => ({
+            tag: "button",
+            text: { tag: "plain_text", content: button.label },
+            type: index === 0 ? "primary" : "danger",
+            value: { payload: button.payload },
+          })),
+        },
+      ],
+    }),
   };
 }
 
@@ -63,38 +97,10 @@ export class FeishuAdapter implements ImAdapter {
   async send(reply: ImReply): Promise<void> {
     const token = this.tenantTokenProvider();
     if (token === null) return; // no tenant token configured: nothing to deliver
-    // Actions render as an interactive card: approval gates must be
-    // approvable from Feishu, not just from Telegram. Button values carry the
-    // same compact payloads the inbound card.action.trigger handler decodes.
-    const buttons = (reply.actions ?? [])
-      .map((action) => ({ label: action.label, payload: encodeCallback(action.command) }))
-      .filter((button): button is { label: string; payload: string } => button.payload !== null);
-    const body = buttons.length === 0
-      ? { receive_id: reply.conversationId, msg_type: "text", content: JSON.stringify({ text: reply.text }) }
-      : {
-          receive_id: reply.conversationId,
-          msg_type: "interactive",
-          content: JSON.stringify({
-            config: { wide_screen_mode: true },
-            header: { title: { tag: "plain_text", content: "AgentDock" }, template: "blue" },
-            elements: [
-              { tag: "div", text: { tag: "lark_md", content: reply.text } },
-              {
-                tag: "action",
-                actions: buttons.map((button, index) => ({
-                  tag: "button",
-                  text: { tag: "plain_text", content: button.label },
-                  type: index === 0 ? "primary" : "danger",
-                  value: { payload: button.payload },
-                })),
-              },
-            ],
-          }),
-        };
     await this.fetchImpl("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify(body),
+      body: JSON.stringify(feishuMessageBody(reply)),
     });
   }
 

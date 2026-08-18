@@ -50,6 +50,16 @@ test("ProcessRunner cancelAll cancels running processes", async () => {
   await assert.rejects(promise, ProcessCancelledError);
 });
 
+test("ProcessRunner escalates a cancelled SIGTERM-ignoring process to SIGKILL within seconds", async () => {
+  const local = new ProcessRunner();
+  // The child ignores SIGTERM; only the cancel escalation (SIGKILL) can stop it.
+  const promise = local.run({ cwd: process.cwd(), argv: [process.execPath, "-e", 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 120000)'], env: { PATH: process.env.PATH! }, timeoutMs: 120_000 });
+  setTimeout(() => local.cancelAll(), 150);
+  const startedAt = Date.now();
+  await assert.rejects(promise, ProcessCancelledError);
+  assert.ok(Date.now() - startedAt < 15_000, "cancel escalates to SIGKILL in ~5s, independent of the 120s step timeout");
+});
+
 test("ProcessRunner kills the whole process tree on timeout", async () => {
   const marker = join(tmpdir(), `agentdock-tree-${Date.now()}`);
   // Child that spawns a grandchild; the grandchild keeps running past the child's death.
@@ -68,11 +78,33 @@ test("ProcessRunner kills the whole process tree on timeout", async () => {
 });
 
 test("agentEnvironment only passes through allowlisted variables", () => {
-  const env = agentEnvironment({ PATH: "/bin", HOME: "/home/u", ANTHROPIC_API_KEY: "secret", AWS_SECRET: "leak" }, { AGENTDOCK_TASK: "t1" });
+  const env = agentEnvironment({ PATH: "/bin", HOME: "/home/u", https_proxy: "http://127.0.0.1:7890", ANTHROPIC_API_KEY: "secret", AWS_SECRET: "leak" }, { AGENTDOCK_TASK: "t1" });
   assert.equal(env.PATH, "/bin");
   assert.equal(env.AGENTDOCK_TASK, "t1");
+  assert.equal(env.https_proxy, "http://127.0.0.1:7890/", "proxy settings pass through (URL-normalized): many networks require them to reach model APIs");
   assert.equal("ANTHROPIC_API_KEY" in env, false);
   assert.equal("AWS_SECRET" in env, false);
+});
+
+test("agentEnvironment strips credentials from proxy URL userinfo", () => {
+  const env = agentEnvironment({ HTTPS_PROXY: "http://alice:password@proxy:8080", NO_PROXY: "localhost" }, {});
+  assert.equal(env.HTTPS_PROXY, "http://proxy:8080/", "proxy userinfo must not reach agents");
+  assert.equal(env.NO_PROXY, "localhost", "non-URL proxy vars pass unchanged");
+});
+
+test("agentEnvironment rejects unparseable credential-looking proxies and multi-@ userinfo", () => {
+  const env = agentEnvironment({ http_proxy: "alice:password@proxy:8080" }, {});
+  assert.equal("http_proxy" in env, false, "unparseable credential-bearing proxy is dropped");
+  const multi = agentEnvironment({ https_proxy: "http://alice:p@ss@proxy:8080" }, {});
+  assert.equal(multi.https_proxy, "http://proxy:8080/", "password containing @ is fully removed");
+});
+
+test("agentEnvironment cleans proxy credentials across schemes, schemeless values, and extra overrides", () => {
+  const env = agentEnvironment({ http_proxy: "socks://alice:secret@proxy:1080" }, { HTTPS_PROXY: "socks4a://alice:secret@proxy:1080" });
+  assert.equal(env.http_proxy, "socks://proxy:1080");
+  assert.equal(env.HTTPS_PROXY, "socks4a://proxy:1080", "extra-injected proxy vars are sanitized too");
+  const schemeless = agentEnvironment({ all_proxy: "//alice:secret@proxy:8080" }, {});
+  assert.equal("all_proxy" in schemeless, false, "schemeless userinfo value fails closed");
 });
 
 function scriptAgent(provider: string, behavior: (context: AgentRunContext) => { code: number; stdout: string; stderr?: string; sessionId?: string }): CodingAgent {

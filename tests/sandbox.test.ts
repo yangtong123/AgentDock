@@ -6,17 +6,19 @@ import test from "node:test";
 import { ProcessRunner } from "../src/runtime/process-runner.js";
 import { OsSandbox, SandboxUnavailableError } from "../src/runtime/os-sandbox.js";
 import { PROFILES, resolveProfile } from "../src/security/permissions.js";
-import { ClaudeAgent, CodexAgent } from "../src/runtime/env-agents.js";
+import { ClaudeAgent, CodexAgent, EnvCodingAgent, defaultCaBundlePath } from "../src/runtime/env-agents.js";
 
-function spyRunner(): { runner: ProcessRunner; argv: () => string[] } {
+function spyRunner(): { runner: ProcessRunner; argv: () => string[]; env: () => Record<string, string> } {
   let lastArgv: string[] = [];
+  let lastEnv: Record<string, string> = {};
   const runner = {
-    run: async (options: { argv: string[] }) => {
+    run: async (options: { argv: string[]; env: Record<string, string> }) => {
       lastArgv = options.argv;
+      lastEnv = options.env;
       return { stdout: "", stderr: "", exitCode: 0, signal: null, timedOut: false, cancelled: false };
     },
   } as unknown as ProcessRunner;
-  return { runner, argv: () => lastArgv };
+  return { runner, argv: () => lastArgv, env: () => lastEnv };
 }
 
 test("layer 1: claude uses permission mode + tool allowlist unless full-access", async () => {
@@ -39,16 +41,60 @@ test("layer 1: claude uses permission mode + tool allowlist unless full-access",
 });
 
 test("layer 1: codex uses workspace-write sandbox unless full-access", async () => {
-  const { runner, argv } = spyRunner();
+  const { runner, argv, env } = spyRunner();
   const codex = new CodexAgent(runner);
   await codex.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {}, profile: PROFILES["default"]! });
   const args = argv();
   assert.equal(args.includes("--dangerously-bypass-approvals-and-sandbox"), false, "dangerous flag must be gone");
   assert.equal(args[args.indexOf("-s") + 1], "workspace-write");
   assert.match(args.join(" "), /sandbox_workspace_write\.network_access/);
+  // TLS roots come from a file bundle: rustls must not need macOS trustd/
+  // securityd XPC, keeping the Seatbelt profile free of broker access. The
+  // bundle path is platform-dependent — assert whatever the resolver selects.
+  const bundle = defaultCaBundlePath();
+  if (bundle !== null) assert.equal(env().SSL_CERT_FILE, bundle);
+  else assert.equal("SSL_CERT_FILE" in env(), false);
 
-  await codex.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {}, profile: { ...PROFILES["default"]!, providerMode: "full-access" } });
+  await codex.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {}, profile: PROFILES["full-access"]! });
   assert.equal(argv().includes("--dangerously-bypass-approvals-and-sandbox"), true, "explicit full-access opt-in keeps the old flag");
+  assert.equal("SSL_CERT_FILE" in env(), false, "full-access runs unsandboxed: the system trust chain (enterprise Keychain CAs) stays in use");
+});
+
+test("layer 2: bwrap argv exposes per-invocation extra read paths (custom CA bundle)", () => {
+  const argv = OsSandbox.bwrapArgv(PROFILES["restricted"]!, "/wt", ["codex", "exec"], ["/opt/enterprise-ca.pem"]);
+  const index = argv.findIndex((arg, i) => arg === "--ro-bind-try" && argv[i + 1] === "/opt/enterprise-ca.pem");
+  assert.ok(index >= 0, "a custom CA file outside /etc is read-only bound into the namespace");
+});
+
+test("provider envExtra cannot smuggle proxy credentials past screening", async () => {
+  const { runner, env } = spyRunner();
+  const agent = new EnvCodingAgent(runner, {
+    provider: "custom",
+    binary: "custom-cli",
+    argv: () => ["custom-cli", "run"],
+    envExtra: () => ({ HTTPS_PROXY: "http://alice:secret@proxy:8080" }),
+    parseSessionId: () => null,
+  });
+  await agent.run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {}, profile: PROFILES["default"]! });
+  assert.equal(env().HTTPS_PROXY, "http://proxy:8080/", "envExtra proxy credentials are stripped like any other source");
+});
+
+test("layer 2 (integration): bwrap write-jail blocks writes outside the worktree", async () => {
+  if (process.platform !== "linux") return; // bwrap is linux-only
+  const base = mkdtempSync(join(tmpdir(), "agentdock-bwrap-"));
+  const worktree = join(base, "wt"); const outside = join(base, "outside");
+  mkdirSync(worktree, { recursive: true }); mkdirSync(outside, { recursive: true });
+  try {
+    const profile = PROFILES["restricted"]!;
+    const outsidePlan = OsSandbox.plan(profile, worktree, ["/usr/bin/sh", "-c", 'echo x > "$1"', "sh", join(outside, "escaped.txt")]);
+    if (outsidePlan.mechanism !== "bwrap") return; // namespaces unavailable on this host
+    const runner = new ProcessRunner();
+    await runner.run({ cwd: worktree, argv: outsidePlan.argv, env: { PATH: process.env.PATH! }, timeoutMs: 10_000 }).catch(() => null);
+    assert.equal(existsSync(join(outside, "escaped.txt")), false, "write outside the worktree must be blocked");
+    const insidePlan = OsSandbox.plan(profile, worktree, ["/usr/bin/sh", "-c", 'echo x > "$1"', "sh", join(worktree, "ok.txt")]);
+    await runner.run({ cwd: worktree, argv: insidePlan.argv, env: { PATH: process.env.PATH! }, timeoutMs: 10_000 });
+    assert.equal(existsSync(join(worktree, "ok.txt")), true, "write inside the worktree must succeed");
+  } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
 test("layer 2: seatbelt profile denies writes outside allowlisted paths", () => {
@@ -59,6 +105,10 @@ test("layer 2: seatbelt profile denies writes outside allowlisted paths", () => 
   assert.match(sbProfile, new RegExp(`subpath "${worktree}"`));
   // Network is allowed at the OS layer: the agent CLI's model-API traffic needs it.
   assert.match(sbProfile, /allow network\*/);
+  // No macOS system brokers: mach-lookup to trustd/securityd/configd etc. would
+  // give a compromised agent XPC access to credential-adjacent services. Codex
+  // gets TLS roots via SSL_CERT_FILE instead (see CodexAgent).
+  assert.equal(sbProfile.includes("mach-lookup"), false, "seatbelt must not grant mach-lookup to system brokers");
 });
 
 test("layer 2: plan() resolves write-jail per platform and fails closed when unenforceable", () => {

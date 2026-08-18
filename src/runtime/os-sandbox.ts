@@ -33,7 +33,7 @@ export class OsSandbox {
   static setBwrapAvailable(available: boolean | null): void { OsSandbox.bwrapAvailable = available; }
 
   /** Resolves the plan for one agent invocation. Throws SandboxUnavailableError when fail-closed and unenforceable. */
-  static plan(profile: PermissionProfile, worktreePath: string, argv: string[], options: { bwrapAvailable?: boolean } = {}): SandboxPlan {
+  static plan(profile: PermissionProfile, worktreePath: string, argv: string[], options: { bwrapAvailable?: boolean; extraReadPaths?: string[] } = {}): SandboxPlan {
     if (profile.osSandbox === "none") return { mode: "none", mechanism: "none", argv, fallbackReason: null };
 
     if (process.platform === "darwin") {
@@ -42,7 +42,7 @@ export class OsSandbox {
 
     const bwrapAvailable = options.bwrapAvailable ?? this.detectBwrap();
     if (bwrapAvailable) {
-      return { mode: "write-jail", mechanism: "bwrap", argv: this.bwrapArgv(profile, worktreePath, argv), fallbackReason: null };
+      return { mode: "write-jail", mechanism: "bwrap", argv: this.bwrapArgv(profile, worktreePath, argv, options.extraReadPaths ?? []), fallbackReason: null };
     }
 
     const reason = `write-jail requested but no mechanism exists on ${process.platform} (install bubblewrap)`;
@@ -57,6 +57,12 @@ export class OsSandbox {
    * Seatbelt cannot distinguish it from child-process traffic. Paths are
    * realpath-normalized because Seatbelt matches literal prefixes — /tmp vs
    * /private/tmp mismatches would silently deny legitimate writes.
+   *
+   * Deliberately no mach-lookup allowances: macOS system brokers (trustd,
+   * securityd/SecurityServer, configd, ...) would give a compromised agent
+   * XPC access to credential-adjacent services. Runtimes that need system
+   * trust for TLS (codex/rustls) get a file-based root bundle via
+   * SSL_CERT_FILE instead — see CodexAgent.
    */
   static seatbeltProfile(profile: PermissionProfile, worktreePath: string): string {
     const home = process.env.HOME ?? "/Users/unknown";
@@ -81,7 +87,7 @@ ${writeRules}
 `;
   }
 
-  static bwrapArgv(profile: PermissionProfile, worktreePath: string, argv: string[]): string[] {
+  static bwrapArgv(profile: PermissionProfile, worktreePath: string, argv: string[], extraReadPaths: string[] = []): string[] {
     const home = process.env.HOME ?? "/home/unknown";
     const args = [
       "bwrap",
@@ -105,6 +111,9 @@ ${writeRules}
       "--setenv", "HOME", home,
     ];
     for (const path of profile.extraReadPaths ?? []) args.push("--ro-bind-try", path, path);
+    // Per-invocation extras (e.g. a custom SSL_CERT_FILE outside /etc): the
+    // file would otherwise be invisible inside the namespace.
+    for (const path of extraReadPaths) args.push("--ro-bind-try", path, path);
     // Network stays up: --unshare-net would also kill the agent's model-API traffic.
     args.push("--", ...argv);
     return args;
@@ -122,12 +131,17 @@ ${writeRules}
 
   private static detectBwrap(): boolean {
     if (OsSandbox.bwrapAvailable !== null) return OsSandbox.bwrapAvailable;
-    try {
-      execFileSync("bwrap", ["--version"], { stdio: "ignore" });
-      OsSandbox.bwrapAvailable = true;
-    } catch {
-      OsSandbox.bwrapAvailable = false;
+    // `bwrap --version` only proves the binary exists. Run a real namespace
+    // smoke test: user-namespace creation can be blocked (AppArmor, sysctl)
+    // even when the binary runs. /bin vs /usr/bin varies across distros.
+    for (const trueBinary of ["/bin/true", "/usr/bin/true"]) {
+      try {
+        execFileSync("bwrap", ["--ro-bind", "/", "/", "--", trueBinary], { stdio: "ignore", timeout: 10_000 });
+        OsSandbox.bwrapAvailable = true;
+        return true;
+      } catch { /* try the next location */ }
     }
-    return OsSandbox.bwrapAvailable;
+    OsSandbox.bwrapAvailable = false;
+    return false;
   }
 }

@@ -5,6 +5,12 @@ import type { ImAdapter, ImCommand, ImReply } from "./im-adapter.js";
 import { parseCommand } from "./command-parser.js";
 import { AuditLog } from "../security/permissions.js";
 import type { Orchestrator } from "../reliability/orchestrator.js";
+import { TaskQueue } from "../reliability/task-queue.js";
+import { TransactionalOutbox } from "../reliability/outbox.js";
+import { ACTIVITY_EVENTS } from "../activity/activity-log.js";
+import { approveRun, cancelRun, createTask, validateProviderAssignment, type CommandContext } from "../commands/task-commands.js";
+import { DEFAULT_PROVIDERS, type ProviderAssignment } from "../workflows/presets.js";
+import type { TaskDetails } from "../shared/domain.js";
 
 /**
  * Domain-level controller shared by every IM adapter (Telegram now, Feishu
@@ -41,7 +47,14 @@ export class ImController {
   register(adapter: ImAdapter): void {
     adapter.onMessage(async (message) => {
       const command = parseCommand(message.conversationId, message.text);
-      if (command) await this.handle(command, adapter.name);
+      if (command) { await this.handle(command, adapter.name); return; }
+      // A malformed /run must not be silently dropped: reply with usage.
+      if (message.text.trim().startsWith("/run")) {
+        await adapter.send({
+          conversationId: message.conversationId,
+          text: "Usage: /run TASK_ID PRESET [STEP=provider ...]\nPresets: fast, cross-review, careful, fix\nSteps (uppercase, no duplicates): PLAN IMPLEMENT VERIFY REVIEW FIX FINAL_REVIEW\nExample: /run abc123 cross-review IMPLEMENT=claude REVIEW=codex",
+        });
+      }
     });
     adapter.onAction(async (command) => { await this.handle(command, adapter.name); });
     this.adapters.set(adapter.name, adapter);
@@ -73,12 +86,14 @@ export class ImController {
   /** Outbox dispatcher entry point: push a notification to the conversation's adapter. */
   async notify(conversationId: string, text: string, adapterHint: string | null = null): Promise<void> {
     // The subscription's adapter hint wins: same conversationId on two
-    // platforms must never receive each other's notifications.
+    // platforms must never receive each other's notifications. Legacy rows
+    // (adapter '') resolve through the durable origin record.
     const origin = adapterHint ?? this.originAdapterOf(conversationId) ?? null;
     const adapter = origin !== null ? this.adapters.get(origin) : undefined;
     if (adapter !== undefined) { await adapter.send({ conversationId, text }); return; }
-    // Never seen this conversation: try every adapter; wrong-platform sends fail silently.
-    for (const candidate of this.adapters.values()) await candidate.send({ conversationId, text }).catch(() => undefined);
+    // Never broadcast to every adapter: an unknown conversation/adapter must be
+    // dropped, not leaked across identities (cross-channel rule 5).
+    console.error(`[agentdock] no known adapter for conversation ${conversationId}; notification dropped`);
   }
 
   async startAll(): Promise<void> {
@@ -89,14 +104,32 @@ export class ImController {
     await Promise.all([...this.adapters.values()].map((adapter) => adapter.stop()));
   }
 
+  /** Command context for shared handlers: the IM surface is one client of the
+   *  same command path as CLI and the gateway. */
+  private commands(): CommandContext {
+    return {
+      db: this.db,
+      app: this.app,
+      queue: this.orchestrator?.queue ?? new TaskQueue(this.db),
+      outbox: new TransactionalOutbox(this.db),
+      activity: this.app.activity,
+      audit: this.audit,
+      ...(this.orchestrator !== null ? { orchestrator: this.orchestrator } : {}),
+    };
+  }
+
   /** handle() with no adapter routes to every adapter (used by tests and internal callers). */
   async handle(command: ImCommand, originAdapter?: string): Promise<ImReply> {
     const taskId = "taskId" in command ? command.taskId : undefined;
-    const entry: { actor: string; action: string; detail: Record<string, unknown> } & { taskId?: string } = { actor: command.conversationId, action: command.type, detail: { originAdapter: originAdapter ?? "internal" } };
+    // Actor is the surface (telegram/feishu), not the chat id; the conversation
+    // id travels in the audit detail.
+    const actor = originAdapter ?? "internal";
+    const entry: { actor: string; action: string; detail: Record<string, unknown> } & { taskId?: string } = { actor, action: command.type, detail: { originAdapter: originAdapter ?? "internal", conversationId: command.conversationId } };
+    if ("runId" in command) entry.detail.runId = command.runId;
     if (taskId !== undefined) entry.taskId = taskId;
     this.audit.record(entry);
     if (originAdapter !== undefined) this.rememberConversationAdapter(command.conversationId, originAdapter);
-    const reply = await this.dispatch(command);
+    const reply = await this.dispatch(command, actor);
     if (originAdapter !== undefined) {
       const adapter = this.adapters.get(originAdapter);
       if (adapter) await adapter.send(reply);
@@ -106,13 +139,18 @@ export class ImController {
     return reply;
   }
 
-  private async dispatch(command: ImCommand): Promise<ImReply> {
+  private async dispatch(command: ImCommand, actor: string): Promise<ImReply> {
     const respond = (text: string, actions?: ImReply["actions"]): ImReply => (actions === undefined ? { conversationId: command.conversationId, text } : { conversationId: command.conversationId, text, actions });
     try {
       switch (command.type) {
         case "LIST_PROJECTS": {
           const projects = this.app.projects.list();
           return respond(projects.length === 0 ? "No projects registered." : projects.map((p) => `${p.status === "ACTIVE" ? "●" : "○"} ${p.name}`).join("\n"));
+        }
+        case "LIST_PROVIDERS": {
+          const providers = Object.keys(this.app.agents);
+          const defaults = Object.entries(DEFAULT_PROVIDERS).map(([step, provider]) => `${step}=${provider}`).join(" ");
+          return respond(`Providers: ${providers.join(", ")}\nDefaults: ${defaults}\nAssign per run: /run TASK_ID PRESET STEP=provider ...`);
         }
         case "USE_PROJECT": {
           const project = this.app.projects.list().find((p) => p.name === command.projectName);
@@ -123,8 +161,11 @@ export class ImController {
         case "CREATE_TASK": {
           const projectId = this.focus(command.conversationId);
           if (!projectId) return respond("Select a project first with /use NAME.");
-          const { task } = this.app.tasks.create(projectId, command.request);
-          return respond(`Task created: ${task.id}\nStart it with /run ${task.id} fast|cross-review|careful`);
+          const details = await createTask(
+            this.commands(),
+            { projectId, request: command.request, actor },
+          ) as TaskDetails;
+          return respond(`Task created: ${details.task.id}\nStart it with /run ${details.task.id} fast|cross-review|careful`);
         }
         case "LIST_TASKS": {
           const projectId = this.focus(command.conversationId);
@@ -136,23 +177,31 @@ export class ImController {
           const projectId = this.focus(command.conversationId);
           if (!projectId) return respond("Select a project first with /use NAME.");
           try {
+            // Provider names validate against the registered agents (parser already
+            // validated step types); the error lists the valid values.
+            const providers = (command.providers ?? {}) as ProviderAssignment;
+            validateProviderAssignment(Object.keys(this.app.agents), providers);
+            const startInput = { taskId: command.taskId, preset: command.preset, providers };
             await this.app.worktrees.prepare(command.taskId);
             if (this.orchestrator !== null) {
               // Production path: the orchestrator executes under lease/concurrency and notifies via outbox.
               // Start + subscribe + enqueue commit as one operation: recovery
               // must never see a QUEUED run without its queue entry.
               const started = withImmediateTransaction(this.db, () => {
-                const s = this.app.workflows.start({ taskId: command.taskId, preset: command.preset });
+                const s = this.app.workflows.start(startInput);
                 this.trackTaskInterest(command.conversationId, command.taskId, this.originAdapterOf(command.conversationId) ?? null);
                 this.orchestrator!.queue.enqueue(command.taskId);
+                this.app.activity.record({ type: ACTIVITY_EVENTS.runQueued, taskId: command.taskId, runId: s.run.id, actor, payload: { preset: command.preset, ...(Object.keys(providers).length > 0 ? { providers } : {}) } });
                 return s;
               });
+              this.audit.record({ actor, action: "run.start", taskId: command.taskId, detail: { runId: started.run.id, preset: command.preset } });
               return respond(`Run ${started.run.id} queued.`);
             }
-            const started = this.app.workflows.start({ taskId: command.taskId, preset: command.preset });
+            const started = this.app.workflows.start(startInput);
+            this.audit.record({ actor, action: "run.start", taskId: command.taskId, detail: { runId: started.run.id, preset: command.preset } });
             const status = await this.app.workflows.execute(started.run.id);
             return respond(status.awaitingApproval
-              ? `Run ${started.run.id} paused for your approval.`
+              ? `Run ${started.run.id} paused for your approval.\n/approve ${started.run.id} or /reject ${started.run.id}`
               : `Run ${started.run.id} finished: ${status.run.state}.`, status.awaitingApproval ? [
                 { label: "Approve", command: { type: "APPROVE_RUN", conversationId: command.conversationId, runId: started.run.id, approved: true } },
                 { label: "Reject", command: { type: "APPROVE_RUN", conversationId: command.conversationId, runId: started.run.id, approved: false } },
@@ -165,7 +214,7 @@ export class ImController {
           const details = this.app.tasks.show(command.taskId);
           const run = this.activeRunFor(command.taskId);
           if (run?.awaitingApproval) {
-            return respond(`Task ${command.taskId} (${details.task.state}) is awaiting your approval.`, [
+            return respond(`Task ${command.taskId} (${details.task.state}) is awaiting your approval — run ${run.run.id}.\n/approve ${run.run.id} or /reject ${run.run.id}`, [
               { label: "Approve", command: { type: "APPROVE_RUN", conversationId: command.conversationId, runId: run.run.id, approved: true } },
               { label: "Reject", command: { type: "APPROVE_RUN", conversationId: command.conversationId, runId: run.run.id, approved: false } },
             ]);
@@ -180,32 +229,32 @@ export class ImController {
           if (!task) return respond(`Unknown task: ${command.taskId}`);
           const run = this.activeRunFor(command.taskId);
           if (run) {
-            if (this.orchestrator !== null) {
-              // Real cancellation: kill the task's process tree, then mark cancelled.
-              this.orchestrator.requestCancel(command.taskId);
-            }
-            this.app.workflows.cancel(run.run.id);
+            // Shared handler: engine cancel + process kill + run.cancelled notification.
+            await cancelRun(this.commands(), { runId: run.run.id, actor });
             return respond(`Task ${command.taskId} stopped (run ${run.run.id} cancelled).`);
           }
           return respond(`Task ${command.taskId} is ${task.state}; nothing to stop.`);
         }
         case "APPROVE_RUN": {
           if (!command.approved) {
-            this.app.workflows.approve(command.runId, false);
-            return respond("Rejected. The workflow is cancelled.");
+            // Reject goes through the shared command handler: audit + activity included.
+            await approveRun(this.commands(), { runId: command.runId, approved: false, actor });
+            return respond(`Rejected. The workflow is cancelled (run ${command.runId}).`);
           }
           if (this.orchestrator !== null) {
-            // Approve + re-enqueue commit as one operation: orphan recovery
-            // must never observe the approved run without its queue entry.
-            // Resumed execution goes through the orchestrator like any other
-            // run: lease, concurrency gates, task timeout, crash recovery.
-            const message = withImmediateTransaction(this.db, () => {
-              this.app.workflows.approve(command.runId, true);
-              return this.enqueueResume(command.runId, command.conversationId);
-            });
-            return respond(message);
+            // Shared handler: approve + re-enqueue commit atomically. The
+            // subscription follows immediately — it is notification routing,
+            // not part of the recovery invariant (start+enqueue).
+            await approveRun(this.commands(), { runId: command.runId, approved: true, actor });
+            const taskId = this.taskIdForRun(command.runId);
+            if (taskId !== null) {
+              this.trackTaskInterest(command.conversationId, taskId, this.originAdapterOf(command.conversationId) ?? null);
+              return respond(`Run ${command.runId} resumed: queued for the orchestrator.`);
+            }
+            return respond(`Run ${command.runId} resumed.`);
           }
-          this.app.workflows.approve(command.runId, true);
+          // No orchestrator (tests, CLI-driven usage): approve inline, resume inline.
+          this.app.workflows.approve(command.runId, true, { actor });
           return respond(this.resumeRun(command.runId, command.conversationId));
         }
         case "CONTINUE_RUN": {

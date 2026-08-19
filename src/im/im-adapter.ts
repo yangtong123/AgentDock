@@ -3,9 +3,10 @@ import type { StepType } from "../shared/domain.js";
 /** Domain-level commands created by IM adapters. Handlers never run agents or shell commands directly. */
 export type ImCommand =
   | { type: "LIST_PROJECTS"; conversationId: string }
+  | { type: "LIST_PROVIDERS"; conversationId: string }
   | { type: "USE_PROJECT"; conversationId: string; projectName: string }
   | { type: "CREATE_TASK"; conversationId: string; request: string }
-  | { type: "RUN_TASK"; conversationId: string; taskId: string; preset: string }
+  | { type: "RUN_TASK"; conversationId: string; taskId: string; preset: string; providers?: Record<string, string> }
   | { type: "LIST_TASKS"; conversationId: string }
   | { type: "TASK_STATUS"; conversationId: string; taskId: string }
   | { type: "STOP_TASK"; conversationId: string; taskId: string }

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { RunState, StepRun, Task, TaskRevision, WorkflowRun } from "../shared/domain.js";
-import { NotFoundError, ValidationError } from "../shared/domain.js";
+import { NotFoundError, StateConflictError } from "../shared/domain.js";
+import { ACTIVITY_EVENTS, type ActivitySink } from "../activity/activity-log.js";
 import type { WorkflowRepository } from "./workflow-repository.js";
 import type { TaskRepository } from "../tasks/task-repository.js";
 import type { ProjectRepository } from "../projects/project-repository.js";
@@ -47,6 +48,8 @@ export class WorkflowEngine {
   private readonly metrics: { recordStepDuration(stepRunId: string, durationMs: number): void } | null;
   private readonly usage: ((entry: { taskId: string; provider: string; role: string; durationMs: number }) => void) | null;
   private readonly budgetGuard: (taskId: string) => { ok: boolean; reason?: string } | null;
+  /** Optional durable activity stream sink; null keeps the engine dependency-free in tests. */
+  private readonly activity: ActivitySink | null;
 
   constructor(
     private readonly workflows: WorkflowRepository,
@@ -58,7 +61,7 @@ export class WorkflowEngine {
     baseEnv: NodeJS.ProcessEnv = process.env,
     now: () => string = () => new Date().toISOString(),
     fixInstructions: (taskId: string) => string | null = () => null,
-    observability: { metrics?: { recordStepDuration(stepRunId: string, durationMs: number): void }; usage?: (entry: { taskId: string; provider: string; role: string; durationMs: number }) => void; budgetGuard?: (taskId: string) => { ok: boolean; reason?: string } | null } = {},
+    observability: { metrics?: { recordStepDuration(stepRunId: string, durationMs: number): void }; usage?: (entry: { taskId: string; provider: string; role: string; durationMs: number }) => void; budgetGuard?: (taskId: string) => { ok: boolean; reason?: string } | null; activity?: ActivitySink } = {},
   ) {
     this.baseEnv = baseEnv;
     this.now = now;
@@ -66,6 +69,7 @@ export class WorkflowEngine {
     this.metrics = observability.metrics ?? null;
     this.usage = observability.usage ?? null;
     this.budgetGuard = observability.budgetGuard ?? (() => null);
+    this.activity = observability.activity ?? null;
   }
 
   private readonly baseEnv: NodeJS.ProcessEnv;
@@ -77,7 +81,7 @@ export class WorkflowEngine {
   start(input: StartWorkflowInput): WorkflowStatus {
     const task = this.tasks.findById(input.taskId);
     if (!task) throw new NotFoundError(`Task ${input.taskId} not found`);
-    if (task.state !== "READY") throw new ValidationError(`Task ${input.taskId} is ${task.state}; workflows start from READY tasks`);
+    if (task.state !== "READY") throw new StateConflictError(`Task ${input.taskId} is ${task.state}; workflows start from READY tasks`);
     const steps = expandPreset(input.preset, input.providers);
     const revision = this.tasks.findRevision(task.id, task.currentRevision);
     if (!revision) throw new NotFoundError(`Task ${task.id} revision ${task.currentRevision} not found`);
@@ -101,6 +105,7 @@ export class WorkflowEngine {
     const stepTimeoutMs = run.stepTimeoutMs;
 
     this.workflows.updateRun(runId, { state: "RUNNING", updatedAt: this.now() });
+    this.activity?.record({ type: ACTIVITY_EVENTS.runRunning, taskId: task.id, runId });
     const threads = new Map<string, string>(); // role -> thread id, for RESUME session policy
     let fixProvider = this.workflows.listSteps(runId).find((s) => s.stepType === "FIX")?.provider ?? null;
     let reviewProvider = this.workflows.listSteps(runId).find((s) => s.stepType === "REVIEW")?.provider ?? null;
@@ -125,18 +130,22 @@ export class WorkflowEngine {
       }
 
       const outcome = await this.executeStep(runId, next, task, revision, openFindings, threads, stepTimeoutMs);
-      if (outcome.paused) return { run: this.requireRun(runId), steps: this.workflows.listSteps(runId), awaitingApproval: true };
+      if (outcome.paused) {
+        this.activity?.record({ type: ACTIVITY_EVENTS.runPaused, taskId: task.id, runId });
+        return { run: this.requireRun(runId), steps: this.workflows.listSteps(runId), awaitingApproval: true };
+      }
       if (outcome.state === "FAILED") return this.finishIfNotCancelled(runId, task, "FAILED");
       if (next.stepType === "REVIEW") {
         reviewProvider = next.provider;
         const needsFixes = outcome.review?.verdict === "NEEDS_FIXES";
+        this.activity?.record({ type: ACTIVITY_EVENTS.reviewCompleted, taskId: task.id, runId, stepRunId: next.id, payload: { verdict: outcome.review?.verdict ?? "PASS", findings: outcome.review?.findings.length ?? 0 } });
         openFindings = needsFixes ? (outcome.review?.findings ?? []) : [];
         if (needsFixes) {
           await this.persistFindings(run, task.id, next.id, outcome.review!.findings);
           // reviewRound was snapshotted before this REVIEW succeeded; this run is the latest round.
           if (reviewRound + 1 >= maxRounds) {
             // Bounded loop exhausted: fail instead of reviewing forever.
-            this.stepStateUnlessCancelled(runId, next.id, "FAILED");
+            this.stepStateUnlessCancelled(runId, task.id, next.id, "FAILED");
             return this.finishIfNotCancelled(runId, task, "FAILED");
           }
           // Another round: append FIX -> VERIFY -> REVIEW before FINAL_REVIEW.
@@ -175,7 +184,8 @@ export class WorkflowEngine {
 
   /** Findings are durable: stored as an INLINE artifact so crash/resume keeps the FIX prompt intact. */
   private async persistFindings(run: WorkflowRun, taskId: string, stepRunId: string, findings: ReviewFinding[]): Promise<void> {
-    this.artifacts.create({ id: randomUUID(), taskId, workflowRunId: run.id, stepRunId, kind: "review-findings", name: "review-findings", storage: { type: "INLINE", content: JSON.stringify(findings) }, createdAt: this.now() });
+    const artifact = this.artifacts.create({ id: randomUUID(), taskId, workflowRunId: run.id, stepRunId, kind: "review-findings", name: "review-findings", storage: { type: "INLINE", content: JSON.stringify(findings) }, createdAt: this.now() });
+    this.activity?.record({ type: ACTIVITY_EVENTS.artifactCreated, taskId, runId: run.id, stepRunId, payload: { artifactId: artifact.id, kind: artifact.kind, name: artifact.name } });
   }
 
   private async latestReviewFindings(run: WorkflowRun, taskId: string): Promise<ReviewFinding[]> {
@@ -192,33 +202,52 @@ export class WorkflowEngine {
     if (current.state === "CANCELLED") return this.status(runId);
     this.workflows.updateRun(runId, { state, updatedAt: this.now() });
     this.tasks.update(task.id, { state }, this.now());
+    this.activity?.record({ type: state === "SUCCEEDED" ? ACTIVITY_EVENTS.runSucceeded : ACTIVITY_EVENTS.runFailed, taskId: task.id, runId });
+    this.activity?.record({ type: state === "SUCCEEDED" ? ACTIVITY_EVENTS.taskSucceeded : ACTIVITY_EVENTS.taskFailed, taskId: task.id, runId });
     return { run: this.requireRun(runId), steps: this.workflows.listSteps(runId), awaitingApproval: false };
   }
 
-  approve(runId: string, approved: boolean): WorkflowStatus {
+  approve(runId: string, approved: boolean, context?: { actor?: string }): WorkflowStatus {
     this.requireResumable(runId);
-    const gate = this.workflows.listSteps(runId).find((step) => step.stepType === "HUMAN_APPROVAL" && step.state === "QUEUED");
-    if (!gate) throw new ValidationError(`WorkflowRun ${runId} has no pending approval gate`);
+    const steps = this.workflows.listSteps(runId);
+    // Only the *pending* gate can be decided: every earlier step must have
+    // SUCCEEDED (same predicate as status().awaitingApproval). Approving a
+    // future gate mid-run would silently waive review before the work exists.
+    const gate = steps.find((step) => step.stepType === "HUMAN_APPROVAL" && step.state === "QUEUED" && steps.slice(0, step.sequence).every((earlier) => earlier.state === "SUCCEEDED"));
+    if (!gate) throw new StateConflictError(`WorkflowRun ${runId} has no pending approval gate`);
+    const { task } = this.contextForRun(runId);
     const timestamp = this.now();
     if (approved) {
       this.workflows.updateStep(gate.id, { state: "SUCCEEDED", updatedAt: timestamp });
+      this.activity?.record({ type: ACTIVITY_EVENTS.stepSucceeded, taskId: task.id, runId, stepRunId: gate.id });
     } else {
       this.workflows.updateStep(gate.id, { state: "FAILED", updatedAt: timestamp });
-      for (const step of this.workflows.listSteps(runId)) if (step.state === "QUEUED" || step.state === "RUNNING") this.workflows.updateStep(step.id, { state: "CANCELLED", updatedAt: timestamp });
+      this.activity?.record({ type: ACTIVITY_EVENTS.stepFailed, taskId: task.id, runId, stepRunId: gate.id });
+      for (const step of this.workflows.listSteps(runId)) if (step.state === "QUEUED" || step.state === "RUNNING") {
+        this.workflows.updateStep(step.id, { state: "CANCELLED", updatedAt: timestamp });
+        this.activity?.record({ type: ACTIVITY_EVENTS.stepCancelled, taskId: task.id, runId, stepRunId: step.id });
+      }
       this.workflows.updateRun(runId, { state: "CANCELLED", updatedAt: timestamp });
-      const { task } = this.contextForRun(runId);
       this.tasks.update(task.id, { state: "CANCELLED" }, timestamp);
+      this.activity?.record({ type: ACTIVITY_EVENTS.runCancelled, taskId: task.id, runId });
+      this.activity?.record({ type: ACTIVITY_EVENTS.taskCancelled, taskId: task.id, runId });
     }
+    this.activity?.record({ type: ACTIVITY_EVENTS.approvalDecided, taskId: task.id, runId, stepRunId: gate.id, ...(context?.actor !== undefined ? { actor: context.actor } : {}), payload: { approved } });
     return this.status(runId);
   }
 
   cancel(runId: string): WorkflowStatus {
     this.requireResumable(runId);
-    const timestamp = this.now();
-    for (const step of this.workflows.listSteps(runId)) if (step.state === "QUEUED" || step.state === "RUNNING") this.workflows.updateStep(step.id, { state: "CANCELLED", updatedAt: timestamp });
-    this.workflows.updateRun(runId, { state: "CANCELLED", updatedAt: timestamp });
     const { task } = this.contextForRun(runId);
+    const timestamp = this.now();
+    for (const step of this.workflows.listSteps(runId)) if (step.state === "QUEUED" || step.state === "RUNNING") {
+      this.workflows.updateStep(step.id, { state: "CANCELLED", updatedAt: timestamp });
+      this.activity?.record({ type: ACTIVITY_EVENTS.stepCancelled, taskId: task.id, runId, stepRunId: step.id });
+    }
+    this.workflows.updateRun(runId, { state: "CANCELLED", updatedAt: timestamp });
     if (task.state !== "SUCCEEDED" && task.state !== "FAILED") this.tasks.update(task.id, { state: "CANCELLED" }, timestamp);
+    this.activity?.record({ type: ACTIVITY_EVENTS.runCancelled, taskId: task.id, runId });
+    this.activity?.record({ type: ACTIVITY_EVENTS.taskCancelled, taskId: task.id, runId });
     return this.status(runId);
   }
 
@@ -234,22 +263,26 @@ export class WorkflowEngine {
     const budget = this.budgetGuard(task.id);
     if (budget !== null && !budget.ok) {
       this.workflows.updateStep(step.id, { state: "FAILED", updatedAt: this.now() });
+      this.activity?.record({ type: ACTIVITY_EVENTS.stepFailed, taskId: task.id, runId, stepRunId: step.id, payload: { reason: budget.reason ?? "budget exceeded" } });
       return { state: "FAILED" };
     }
     this.workflows.updateStep(step.id, { state: "RUNNING", updatedAt: this.now() });
+    this.activity?.record({ type: ACTIVITY_EVENTS.stepStarted, taskId: task.id, runId, stepRunId: step.id, payload: { stepType: step.stepType, provider: step.provider } });
     if (step.stepType === "HUMAN_APPROVAL") {
       // External gate: park the step back at QUEUED and surface PAUSED to the caller.
       this.workflows.updateStep(step.id, { state: "QUEUED", updatedAt: this.now() });
+      this.activity?.record({ type: ACTIVITY_EVENTS.approvalRequested, taskId: task.id, runId, stepRunId: step.id });
       return { state: "PAUSED", paused: true };
     }
     if (step.stepType === "VERIFY") {
       const project = this.projects.findById(task.projectId);
       const command = project?.verifyCommand ?? null;
       const startedAt = this.now();
-      const ok = command === null ? true : await this.verify(command, task, stepTimeoutMs);
+      const result = command === null ? { ok: true, output: "" } : await this.verify(command, task, stepTimeoutMs);
       this.recordStepMetrics(step.id, startedAt);
-      this.stepStateUnlessCancelled(runId, step.id, ok ? "SUCCEEDED" : "FAILED");
-      return { state: ok ? "SUCCEEDED" : "FAILED" };
+      this.stepStateUnlessCancelled(runId, task.id, step.id, result.ok ? "SUCCEEDED" : "FAILED");
+      this.activity?.record({ type: ACTIVITY_EVENTS.verifyCompleted, taskId: task.id, runId, stepRunId: step.id, payload: { ok: result.ok, output: result.output.slice(-500) } });
+      return { state: result.ok ? "SUCCEEDED" : "FAILED" };
     }
     const policy: SessionPolicy = DEFAULT_SESSION_POLICIES[step.stepType] ?? "FRESH";
     const resumeThreadId = policy === "RESUME" ? threads.get(step.stepType) : undefined;
@@ -259,13 +292,14 @@ export class WorkflowEngine {
     const execution = await this.runtime.run(
       { taskId: task.id, role: step.stepType, prompt, revisionRequest: revision.request, timeoutMs: stepTimeoutMs, permissionProfile: project?.permissionProfile ?? null },
       step.provider ?? "claude",
-      resumeThreadId === undefined ? {} : { resumeThreadId },
+      { ...(resumeThreadId === undefined ? {} : { resumeThreadId }), workflowRunId: runId, stepRunId: step.id },
     );
     if (policy === "RESUME") threads.set(step.stepType, execution.thread.id);
     this.recordStepMetrics(step.id, startedAt);
     if (this.usage !== null) this.usage({ taskId: task.id, provider: step.provider ?? "unknown", role: step.stepType, durationMs: Date.parse(this.now()) - Date.parse(startedAt) });
+    for (const artifact of execution.artifacts) this.activity?.record({ type: ACTIVITY_EVENTS.artifactCreated, taskId: task.id, runId, stepRunId: step.id, payload: { artifactId: artifact.id, kind: artifact.kind, name: artifact.name } });
     const ok = execution.failure === null;
-    this.stepStateUnlessCancelled(runId, step.id, ok ? "SUCCEEDED" : "FAILED");
+    this.stepStateUnlessCancelled(runId, task.id, step.id, ok ? "SUCCEEDED" : "FAILED");
     const review = step.stepType === "REVIEW" || step.stepType === "FINAL_REVIEW"
       ? parseReviewReport(execution.outcome?.stdout ?? "")
       : undefined;
@@ -279,13 +313,14 @@ export class WorkflowEngine {
   }
 
   /** A concurrent cancel() may have marked this step CANCELLED mid-flight; never overwrite that. */
-  private stepStateUnlessCancelled(runId: string, stepId: string, state: "SUCCEEDED" | "FAILED"): void {
+  private stepStateUnlessCancelled(runId: string, taskId: string, stepId: string, state: "SUCCEEDED" | "FAILED"): void {
     if (this.requireRun(runId).state === "CANCELLED") return;
     this.workflows.updateStep(stepId, { state, updatedAt: this.now() });
+    this.activity?.record({ type: state === "SUCCEEDED" ? ACTIVITY_EVENTS.stepSucceeded : ACTIVITY_EVENTS.stepFailed, taskId, runId, stepRunId: stepId });
   }
 
-  private async verify(command: string[], task: Task, stepTimeoutMs: number): Promise<boolean> {
-    if (!task.worktreePath) return false;
+  private async verify(command: string[], task: Task, stepTimeoutMs: number): Promise<{ ok: boolean; output: string }> {
+    if (!task.worktreePath) return { ok: false, output: "task has no worktree" };
     try {
       const result = await this.verifyRunner.run({
         cwd: task.worktreePath,
@@ -296,12 +331,12 @@ export class WorkflowEngine {
         // stop a long VERIFY, not just agent CLIs.
         owner: task.id,
       });
-      return result.exitCode === 0;
+      return { ok: result.exitCode === 0, output: `${result.stdout}\n${result.stderr}`.trim() };
     } catch (error) {
       // Cancellation propagates like agent-step cancellation: mapping it to a
       // plain failure would stamp FAILED over a CANCEL_REQUESTED task.
       if (error instanceof ProcessCancelledError) throw error;
-      return false;
+      return { ok: false, output: error instanceof Error ? error.message : String(error) };
     }
   }
 
@@ -334,7 +369,7 @@ export class WorkflowEngine {
 
   private requireResumable(runId: string): WorkflowRun {
     const run = this.requireRun(runId);
-    if (isTerminal(run.state)) throw new ValidationError(`WorkflowRun ${runId} already finished (${run.state})`);
+    if (isTerminal(run.state)) throw new StateConflictError(`WorkflowRun ${runId} already finished (${run.state})`);
     return run;
   }
 

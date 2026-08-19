@@ -1,9 +1,18 @@
 import type { ImCommand } from "./im-adapter.js";
+import { STEP_TYPES } from "../shared/domain.js";
+
+/** Presets accepted by /run — kept in lockstep with expandPreset (tested). */
+export const IM_RUN_PRESETS = ["fast", "cross-review", "careful", "fix"] as const;
 
 /**
  * Parses IM text into domain commands. User text becomes command *data*
  * (e.g. a task request) and is never concatenated into shell commands.
  * Returns null for non-command chat.
+ *
+ * /run accepts per-step provider assignments:
+ *   /run TASK_ID PRESET [STEP=provider ...]
+ * Provider names are validated by the controller (it knows the registered
+ * agents); the parser validates step types and token shape only.
  */
 export function parseCommand(conversationId: string, text: string): ImCommand | null {
   const trimmed = text.trim();
@@ -16,6 +25,8 @@ export function parseCommand(conversationId: string, text: string): ImCommand | 
     case "/projects":
     case "/start":
       return { type: "LIST_PROJECTS", conversationId };
+    case "/providers":
+      return { type: "LIST_PROVIDERS", conversationId };
     case "/use":
       if (!argument) return null;
       return { type: "USE_PROJECT", conversationId, projectName: argument };
@@ -27,8 +38,18 @@ export function parseCommand(conversationId: string, text: string): ImCommand | 
       if (parts.length < 2) return null;
       const taskId = parts[0]!;
       const preset = parts[1]!;
-      if (preset !== "fast" && preset !== "cross-review" && preset !== "careful") return null;
-      return { type: "RUN_TASK", conversationId, taskId, preset };
+      if (!(IM_RUN_PRESETS as readonly string[]).includes(preset)) return null;
+      const providers: Record<string, string> = {};
+      for (const token of parts.slice(2)) {
+        const [step, provider, extra] = token.split("=");
+        if (extra !== undefined || !step || !provider) return null;
+        if (!(STEP_TYPES as readonly string[]).includes(step)) return null;
+        if (providers[step] !== undefined) return null; // duplicate STEP= tokens are an error, not last-win
+        providers[step] = provider;
+      }
+      return Object.keys(providers).length === 0
+        ? { type: "RUN_TASK", conversationId, taskId, preset }
+        : { type: "RUN_TASK", conversationId, taskId, preset, providers };
     }
     case "/tasks":
       return { type: "LIST_TASKS", conversationId };

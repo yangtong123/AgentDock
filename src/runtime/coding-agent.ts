@@ -16,6 +16,9 @@ export interface AgentRunContext {
   env: Record<string, string>;
   /** Effective permission profile; agents derive their sandbox flags from it. */
   profile: PermissionProfile;
+  /** Streaming output taps, wired to ProcessRunner's chunk callbacks when set. */
+  onStdout?: (chunk: string) => void;
+  onStderr?: (chunk: string) => void;
 }
 
 export interface AgentRunOutcome {

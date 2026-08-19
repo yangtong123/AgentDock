@@ -39,3 +39,33 @@ jobs:
       - run: npm run typecheck
 
       - run: npm test
+
+      # Workbench: build + unit tests on both OSes.
+      - run: npm --prefix workbench ci
+      - run: npm run build:workbench
+      - run: npm --prefix workbench test
+
+  workbench-e2e:
+    # Playwright end-to-end runs on Ubuntu only; macOS keeps the sandbox-focused
+    # root suite.
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - run: npm --prefix workbench ci
+      - run: npm run build:workbench
+
+      - run: npx playwright install --with-deps chromium
+        working-directory: workbench
+
+      - run: npx playwright test
+        working-directory: workbench

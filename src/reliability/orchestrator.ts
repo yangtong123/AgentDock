@@ -5,6 +5,7 @@ import type { Application } from "../app/application.js";
 import { LeaseManager, TransactionalOutbox, CommandDedup, SystemClock, type Clock } from "./outbox.js";
 import { TaskQueue } from "./task-queue.js";
 import { ProcessRunner } from "../runtime/process-runner.js";
+import { ACTIVITY_EVENTS, type ActivitySink } from "../activity/activity-log.js";
 
 export interface OrchestratorOptions {
   workerId?: string;
@@ -13,6 +14,8 @@ export interface OrchestratorOptions {
   globalConcurrency?: number;
   pollMs?: number;
   taskTimeoutMs?: number;
+  /** Optional durable activity stream sink (task.cancel-requested is mirrored here). */
+  activity?: ActivitySink;
 }
 
 const DEFAULTS = { leaseTtlMs: 60_000, heartbeatMs: 15_000, globalConcurrency: 3, pollMs: 2_000, taskTimeoutMs: 2 * 60 * 60 * 1000, stepTimeoutMs: 30 * 60 * 1000 };
@@ -144,9 +147,28 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * Self-healing approval notifications: a run parked at a QUEUED
+   * HUMAN_APPROVAL gate whose earlier steps all SUCCEEDED must have an
+   * approval.requested outbox event. runTask publishes it when execute()
+   * returns parked, but a crash in between loses it (parked runs are never
+   * re-executed) — this sweep republishes exactly the missing ones.
+   */
+  notifyParkedApprovalGates(): number {
+    const rows = this.db.prepare(`SELECT r.id AS runId, tr.task_id AS taskId
+      FROM workflow_runs r JOIN task_revisions tr ON r.task_revision_id = tr.id
+      WHERE r.state IN ('QUEUED','RUNNING')
+        AND EXISTS (SELECT 1 FROM step_runs g WHERE g.workflow_run_id = r.id AND g.step_type = 'HUMAN_APPROVAL' AND g.state = 'QUEUED'
+                    AND NOT EXISTS (SELECT 1 FROM step_runs p WHERE p.workflow_run_id = r.id AND p.sequence < g.sequence AND p.state NOT IN ('SUCCEEDED')))
+        AND NOT EXISTS (SELECT 1 FROM outbox_events o WHERE o.workflow_run_id = r.id AND o.type = 'approval.requested')`).all() as { runId: string; taskId: string }[];
+    for (const row of rows) this.outbox.publish({ taskId: row.taskId, workflowRunId: row.runId, type: "approval.requested", payload: { taskId: row.taskId, runId: row.runId } });
+    return rows.length;
+  }
+
   async start(): Promise<void> {
     this.stopped = false;
     this.recoverOrphans();
+    this.notifyParkedApprovalGates();
     this.loop = this.runLoop();
   }
 
@@ -163,13 +185,14 @@ export class Orchestrator {
   }
 
   /** Cancels a task: marks CANCEL_REQUESTED, kills that task's process tree only. */
-  requestCancel(taskId: string): void {
+  requestCancel(taskId: string, actor?: string): void {
     const task = this.app.repositories.tasks.findById(taskId);
     if (!task) return;
     if (task.state === "RUNNING") this.app.repositories.tasks.update(taskId, { state: "CANCEL_REQUESTED" }, this.clock.now().toISOString());
     // Owner-scoped: other tasks' agents keep running.
     this.processRunner.cancelOwner(taskId);
     this.outbox.publish({ taskId, type: "task.cancel-requested", payload: { taskId } });
+    this.options.activity?.record({ type: ACTIVITY_EVENTS.taskCancelRequested, taskId, ...(actor !== undefined ? { actor } : {}) });
   }
 
   /**
@@ -227,6 +250,7 @@ export class Orchestrator {
           lastReap = this.clock.now().getTime();
           this.recoverOrphans();
           this.reapFinishedFixRuns();
+          this.notifyParkedApprovalGates();
           void this.runPendingFixes().catch(() => undefined);
         }
         const entry = this.queue.nextDue(
@@ -289,6 +313,11 @@ export class Orchestrator {
       const activeRun = this.activeRunId(taskId);
       if (activeRun === null) throw new Error(`Task ${taskId} has no run to execute`);
       const status = await this.app.workflows.execute(activeRun);
+      if (status.awaitingApproval) {
+        // Approval gates notify subscribed conversations through the outbox
+        // (the engine records the activity event; delivery is outbox machinery).
+        this.outbox.publish({ taskId, workflowRunId: activeRun, type: "approval.requested", payload: { taskId, runId: activeRun } });
+      }
       this.outbox.publish({ taskId, workflowRunId: activeRun, type: `run.${status.run.state.toLowerCase()}`, payload: { taskId, runId: activeRun, state: status.run.state } });
     } catch (error) {
       this.outbox.publish({ taskId, type: "run.worker-error", payload: { taskId, message: error instanceof Error ? error.message : String(error) } });

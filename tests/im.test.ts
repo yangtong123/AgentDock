@@ -6,7 +6,8 @@ import test from "node:test";
 import { openDatabase } from "../src/db/database.js";
 import { createApplication } from "../src/app/application.js";
 import { createRepository } from "./helpers.js";
-import { parseCommand } from "../src/im/command-parser.js";
+import { parseCommand, IM_RUN_PRESETS } from "../src/im/command-parser.js";
+import { expandPreset } from "../src/workflows/presets.js";
 import { ImController } from "../src/im/im-controller.js";
 import { TelegramAdapter, decodeCallback } from "../src/im/telegram-adapter.js";
 import type { ImAdapter, ImMessage, ImReply } from "../src/im/im-adapter.js";
@@ -237,4 +238,44 @@ test("TelegramAdapter ignores chats outside ALLOWED_CHAT_IDS", async () => {
   await adapter.stop();
   parked.resolve?.();
   assert.deepEqual(received, [{ conversationId: "42", text: "/projects" }]);
+});
+
+test("parser: IM_RUN_PRESETS stays in lockstep with expandPreset (drift guard)", () => {
+  for (const preset of IM_RUN_PRESETS) assert.ok(expandPreset(preset).length > 0, `${preset} must expand`);
+  assert.throws(() => expandPreset("not-a-preset"), /Unknown workflow preset/);
+});
+
+test("parser: duplicate STEP= keys are rejected, not last-win", () => {
+  assert.equal(parseCommand("c1", "/run t1 fast IMPLEMENT=claude IMPLEMENT=codex"), null);
+});
+
+test("controller: malformed /run gets a usage reply instead of silence", async () => {
+  const f = controllerFixture();
+  try {
+    const telegram = fakeAdapter("telegram");
+    f.controller.register(telegram);
+    await telegram.deliverMessage({ conversationId: "c1", text: "/run abc123 bogus-preset" });
+    assert.equal(telegram.delivered.length, 1);
+    assert.match(telegram.delivered[0]!.text, /Usage: \/run TASK_ID PRESET/);
+    assert.match(telegram.delivered[0]!.text, /fast, cross-review, careful, fix/);
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("controller: notify never broadcasts to adapters that have not seen the conversation", async () => {
+  const f = controllerFixture();
+  try {
+    const telegram = fakeAdapter("telegram");
+    const feishu = fakeAdapter("feishu");
+    f.controller.register(telegram);
+    f.controller.register(feishu);
+    // Unknown conversation, no adapter hint: dropped, not broadcast.
+    await f.controller.notify("never-seen", "hello");
+    assert.equal(telegram.delivered.length, 0);
+    assert.equal(feishu.delivered.length, 0);
+    // Legacy subscription row (adapter '') resolves through the durable origin.
+    await f.controller.handle({ type: "LIST_PROJECTS", conversationId: "legacy-1" }, "feishu");
+    await f.controller.notify("legacy-1", "hi", null);
+    assert.equal(feishu.delivered.filter((reply) => reply.text === "hi").length, 1);
+    assert.equal(telegram.delivered.filter((reply) => reply.text === "hi").length, 0);
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });

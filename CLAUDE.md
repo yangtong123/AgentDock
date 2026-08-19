@@ -27,6 +27,6 @@ AgentDock is a multi-project coding-agent orchestrator. It coordinates coding ag
 
 ## Current status
 
-All roadmap milestones through **V1.0 — Stable Daily Driver** are implemented (see `docs/ROADMAP.md`). The project is in V1.0 stabilization and release wrap-up: bug fixes, CI, end-to-end acceptance, and the release checklist.
+All roadmap milestones through **V1.0 — Stable Daily Driver** are implemented (see `docs/ROADMAP.md`).
 
-Post-V1.0 features (web dashboard, additional IM adapters, multi-machine workers, etc.) are out of scope until real-world usage feedback justifies them.
+**V1.1 — Cross-Agent Workbench** is in progress (see `docs/tasks/V1.1-CROSS-AGENT-WORKBENCH.md`). Milestone 1 is done: the local gateway (`src/gateway/`, REST + SSE on `127.0.0.1:4173` with a Bearer token, started by `agentdock serve`), the durable activity stream (`src/activity/`), and shared command handlers (`src/commands/`) used by CLI, IM, and HTTP. Implement the remaining V1.1 milestones in the documented order (read-only workbench → desktop controls → cross-channel continuity → release hardening).

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { Task, TaskDetails, TaskRevision } from "../shared/domain.js";
-import { NotFoundError, ValidationError } from "../shared/domain.js";
+import { NotFoundError, StateConflictError, ValidationError } from "../shared/domain.js";
 import type { ProjectRepository } from "../projects/project-repository.js";
 import type { TaskRepository } from "./task-repository.js";
 
@@ -22,4 +22,10 @@ export class TaskService {
   }
   show(taskId:string):TaskDetails { const task=this.tasks.findById(taskId); if(!task) throw new NotFoundError(`Task ${taskId} not found`); const revisions=this.tasks.listRevisions(taskId); const currentRevision=revisions.find(r=>r.revision===task.currentRevision); if(!currentRevision) throw new Error("Task has no current revision"); return {task,currentRevision,revisions}; }
   list(projectId?:string):Task[] { return this.tasks.list(projectId); }
+  /** Reopens a finished task for a retry run: same revision, back to READY. */
+  reopenForRetry(taskId:string):Task {
+    const task=this.tasks.findById(taskId); if(!task) throw new NotFoundError(`Task ${taskId} not found`);
+    if(task.state!=="FAILED"&&task.state!=="CANCELLED") throw new StateConflictError(`Task ${taskId} is ${task.state}; only FAILED or CANCELLED tasks can be reopened for retry`);
+    return this.tasks.update(taskId,{state:"READY"},this.now());
+  }
 }

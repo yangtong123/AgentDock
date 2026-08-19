@@ -131,7 +131,7 @@ export class EnvCodingAgent implements CodingAgent {
       }
       throw error;
     }
-    const runArgs = { cwd: context.worktreePath, argv: plan.argv, env, timeoutMs: context.timeoutMs, owner: context.taskId } as const;
+    const runArgs = { cwd: context.worktreePath, argv: plan.argv, env, timeoutMs: context.timeoutMs, owner: context.taskId, ...(context.onStdout !== undefined ? { onStdout: context.onStdout } : {}), ...(context.onStderr !== undefined ? { onStderr: context.onStderr } : {}) } as const;
     const result = await this.runner.run(this.options.promptViaStdin === true ? { ...runArgs, stdin: context.prompt } : runArgs);
     return this.toOutcome(result, context, plan.fallbackReason);
   }

@@ -12,6 +12,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:workbench": "npm --prefix workbench run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/tests/**/*.test.js",
     "migrate": "npm run build --silent && node dist/src/app/cli.js migrate",

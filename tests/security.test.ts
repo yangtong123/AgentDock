@@ -114,3 +114,92 @@ test("BudgetGuard enforces step-count and duration caps", async () => {
     assert.match(durationBlocked.reason!, /maxDurationMsPerTask/);
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });
+
+/** Credential-shaped orchestrator secrets that must never reach the gateway surface. */
+const SENTINELS: Record<string, string> = {
+  TELEGRAM_BOT_TOKEN: "tg-secret-sentinel-7f3a9c",
+  FEISHU_APP_SECRET: "fs-secret-sentinel-2b8d1e",
+  GH_TOKEN: "gh-secret-sentinel-4c5f06",
+  ANTHROPIC_API_KEY: "ak-secret-sentinel-99aa11",
+};
+
+test("gateway surface never serializes orchestrator secrets", async () => {
+  const saved: Record<string, string | undefined> = {};
+  for (const [key, value] of Object.entries(SENTINELS)) { saved[key] = process.env[key]; process.env[key] = value; }
+  const { createGateway } = await import("../src/gateway/server.js");
+  const { TaskQueue } = await import("../src/reliability/task-queue.js");
+  const base = mkdtempSync(join(tmpdir(), "agentdock-sec-"));
+  try {
+    createRepository(join(base, "repo"));
+    process.env.AGENTDOCK_ARTIFACTS = join(base, "artifacts");
+    const db = openDatabase(":memory:");
+    const failingAgent = { provider: "fake", async run() { return { exitCode: 1, stdout: "agent failed hard", stderr: "", externalSessionId: null, resumed: false }; } };
+    const app = createApplication(db, { agents: { claude: failingAgent, codex: failingAgent } });
+    const token = "test-token";
+    const gateway = createGateway({ db, app, queue: new TaskQueue(db), host: "127.0.0.1", port: 0, token, ssePollIntervalMs: 25 });
+    const { url } = await gateway.start();
+    const bodies: string[] = [];
+    const headers: string[] = [];
+    const capture = async (res: Response) => {
+      bodies.push(await res.text());
+      for (const [name, value] of res.headers.entries()) headers.push(`${name}: ${value}`);
+    };
+    let requestIndex = 0;
+    const api = (method: string, path: string, body?: unknown) => fetch(`${url}/api/v1${path}`, {
+      method,
+      headers: { authorization: `Bearer ${token}`, ...(body !== undefined ? { "content-type": "application/json", "idempotency-key": `sec-${requestIndex++}` } : {}) },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+
+    const project = app.projects.create({ name: "sec", repoPath: join(base, "repo"), worktreeRoot: join(base, "wt") });
+    // A failing workflow run end-to-end: agent output, review errors, activity, audit.
+    const created = (await (await api("POST", "/tasks", { projectId: project.id, request: "do it" })).json()) as { task: { id: string } };
+    const run = (await (await api("POST", `/tasks/${created.task.id}/runs`, { preset: "cross-review" })).json()) as { run: { id: string } };
+    await app.workflows.execute(run.run.id); // fails at IMPLEMENT
+    assert.equal(app.workflows.status(run.run.id).run.state, "FAILED");
+
+    await capture(await api("GET", "/projects"));
+    await capture(await api("GET", "/providers"));
+    await capture(await api("GET", "/workflow-presets"));
+    await capture(await api("GET", "/tasks"));
+    await capture(await api("GET", `/tasks/${created.task.id}`));
+    await capture(await api("GET", `/tasks/${created.task.id}/diff`));
+    await capture(await api("GET", `/tasks/${created.task.id}/artifacts`));
+    await capture(await api("GET", `/tasks/${created.task.id}/activity?limit=200`));
+    await capture(await api("GET", `/runs/${run.run.id}`));
+    const step = app.workflows.status(run.run.id).steps[0]!;
+    await capture(await api("GET", `/steps/${step.id}/log`));
+    await capture(await api("GET", `/steps/${step.id}/log?stream=stderr`));
+    // Error paths: 400/401/404/409.
+    await capture(await api("GET", "/tasks/nope"));
+    await capture(await fetch(`${url}/api/v1/projects`, { headers: { authorization: "Bearer wrong" } }));
+    await capture(await api("GET", "/tasks?state=BOGUS"));
+    await capture(await api("POST", `/runs/${run.run.id}/cancel`, {})); // already terminal → 409
+    // SSE replay of the whole history.
+    const sse = await fetch(`${url}/api/v1/events?token=${token}&lastEventId=0`);
+    const reader = sse.body!.getReader();
+    let sseText = "";
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      const chunk = await Promise.race([reader.read(), new Promise<null>((resolve) => setTimeout(() => resolve(null), 50))]);
+      if (chunk === null) {
+        if (sseText.includes("run.failed")) break;
+        continue;
+      }
+      if (chunk.done) break;
+      sseText += new TextDecoder().decode(chunk.value, { stream: true });
+    }
+    await reader.cancel().catch(() => undefined);
+    await gateway.stop();
+    db.close();
+
+    const everything = [...bodies, ...headers, sseText].join("\n");
+    for (const [name, value] of Object.entries(SENTINELS)) {
+      assert.ok(!everything.includes(value), `${name} sentinel leaked into a gateway response/event/header`);
+    }
+  } finally {
+    for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    delete process.env.AGENTDOCK_ARTIFACTS;
+    rmSync(base, { recursive: true, force: true });
+  }
+});

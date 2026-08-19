@@ -15,6 +15,7 @@ import { AgentThreadManager } from "../runtime/agent-thread-manager.js";
 import { WorkflowEngine } from "../workflows/workflow-engine.js";
 import { MetricsService, BudgetGuard } from "../security/metrics.js";
 import { AuditLog } from "../security/permissions.js";
+import { ActivityLog } from "../activity/activity-log.js";
 import { GitHubService } from "../github/github-service.js";
 import { GhCliAdapter } from "../github/gh-cli-adapter.js";
 import { resolve } from "node:path";
@@ -33,6 +34,7 @@ export function createApplication(db:Database, options:{ agents?: Record<string,
   const metrics=new MetricsService(db);
   const budget=new BudgetGuard(db,metrics);
   const github=new GitHubService(db,new GhCliAdapter(),taskRepository,projectRepository);
+  const activity=new ActivityLog(db);
   return {
     projects:new ProjectService(projectRepository),
     tasks,
@@ -44,13 +46,16 @@ export function createApplication(db:Database, options:{ agents?: Record<string,
       metrics,
       usage:(entry)=>metrics.recordUsage(entry),
       budgetGuard:(taskId)=>budget.withinBudget(taskId,{maxStepsPerTask:100,maxDurationMsPerTask:8*60*60*1000}),
+      activity,
     }),
     /** Shared runner so cancellation reaches the same processes the app spawned. */
     processRunner:runner,
     metrics,
     budget,
     audit:new AuditLog(db),
+    activity,
     github,
+    agents,
     repositories:{projects:projectRepository,tasks:taskRepository,workflows:workflowRepository,agentThreads:agentThreadRepository,artifacts:artifactRepository},
   };
 }

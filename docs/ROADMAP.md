@@ -104,6 +104,14 @@ V1.0 formally supports:
 
 Feishu/Lark must use the same domain-level control model as Telegram. Tasks belong to AgentDock, not to a specific IM conversation. A task created through Telegram must be visible and controllable through Feishu/Lark, and vice versa.
 
-## After V1.0
+## V1.1 — Cross-Agent Workbench (Planned)
 
-Potential later additions include a web dashboard, Slack/Discord adapters, multi-machine workers, stronger container isolation, automatic complexity routing, more coding-agent providers, task dependency DAGs, scheduled work, team RBAC, and multi-tenancy.
+Goal: add a local desktop workbench without creating a second execution model.
+
+The browser workbench and phone IM adapters operate the same durable tasks and orchestrator-owned commands. Users can assign Claude or Codex to implementation and the other provider to review, observe live workflow state, inspect verification/findings/diffs/artifacts, and approve, revise, retry, or stop work from either surface.
+
+V1.1 is split into a local gateway and event stream, read-only workbench, desktop controls, cross-channel continuity, and release hardening. See [the V1.1 Cross-Agent Workbench task](tasks/V1.1-CROSS-AGENT-WORKBENCH.md) for scope, architecture, milestones, non-goals, and acceptance criteria.
+
+## After V1.1
+
+Potential later additions include a native desktop wrapper, richer mobile UI, Slack/Discord adapters, multi-machine workers, stronger container isolation, automatic complexity routing, more coding-agent providers, task dependency DAGs, scheduled work, team RBAC, and multi-tenancy.

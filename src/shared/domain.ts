@@ -33,3 +33,5 @@ export interface Artifact { id: string; taskId: string; workflowRunId: string | 
 
 export class NotFoundError extends Error {}
 export class ValidationError extends Error {}
+/** A ValidationError that means concurrent/stale state, not malformed input (409 semantics). */
+export class StateConflictError extends ValidationError {}

@@ -21,3 +21,8 @@ worktrees/
 .DS_Store
 .idea/
 .vscode/
+
+# Test output
+test-results/
+playwright-report/
+.playwright-mcp/

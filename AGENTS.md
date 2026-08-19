@@ -27,6 +27,6 @@ AgentDock is a multi-project coding-agent orchestrator. It coordinates coding ag
 
 ## Current status
 
-All roadmap milestones through **V1.0 — Stable Daily Driver** are implemented (see `docs/ROADMAP.md`). The project is in V1.0 stabilization and release wrap-up: bug fixes, CI, end-to-end acceptance, and the release checklist.
+All roadmap milestones through **V1.0 — Stable Daily Driver** are implemented (see `docs/ROADMAP.md`).
 
-Post-V1.0 features (web dashboard, additional IM adapters, multi-machine workers, etc.) are out of scope until real-world usage feedback justifies them.
+**V1.1 — Cross-Agent Workbench** is code-complete with all real-environment acceptance runs passed (see `docs/tasks/V1.1-CROSS-AGENT-WORKBENCH.md` and `docs/tasks/v1.1-release-checklist.md`). All five milestones are implemented: the local gateway (`src/gateway/`, REST + SSE on `127.0.0.1:4173` with a Bearer token, started by `agentdock serve`), the durable activity stream (`src/activity/`), shared command handlers (`src/commands/`) used by CLI, IM, and HTTP, the browser workbench (`workbench/`, React + Vite, served by the gateway) with task composer and desktop controls, and cross-channel continuity with normalized actors. Acceptance evidence (2026-08-19): single-provider, both Claude×Codex directions, and cross-channel continuity both ways — desktop-started `careful` run approved from Feishu, Feishu-started run observed live on desktop. Remaining: release mechanics only (commit, CI green on main, README quick-start verification), plus optional hardening of two acceptance findings: `git` fails inside the macOS seatbelt write-jail (`/dev/null` not permitted), and desktop-started tasks notify no IM conversation until the first IM interaction subscribes it.

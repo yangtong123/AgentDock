@@ -17,6 +17,18 @@ export class CommandDedup {
     }
   }
 
+  /** Stores the successful response for a claimed key (HTTP idempotency replay). */
+  storeResponse(commandKey: string, responseJson: string): void {
+    this.db.prepare("UPDATE command_dedup SET response = ? WHERE command_key = ?").run(responseJson, commandKey);
+  }
+
+  /** A claimed key without a response means a request is still in progress. */
+  lookup(commandKey: string): { claimed: boolean; response: string | null } {
+    const row = this.db.prepare("SELECT response FROM command_dedup WHERE command_key = ?").get(commandKey) as { response: string | null } | undefined;
+    if (row === undefined) return { claimed: false, response: null };
+    return { claimed: true, response: row.response ?? null };
+  }
+
   /** Evicts entries older than the retention window. */
   pruneOlderThan(cutoffIso: string): number {
     return Number(this.db.prepare("DELETE FROM command_dedup WHERE created_at < ?").run(cutoffIso).changes);

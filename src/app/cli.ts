@@ -14,6 +14,10 @@ import { Orchestrator } from "../reliability/orchestrator.js";
 import { OutboxDispatcher } from "../reliability/outbox-dispatcher.js";
 import { TransactionalOutbox } from "../reliability/outbox.js";
 import { TaskQueue } from "../reliability/task-queue.js";
+import { createTask, reviseTask, prepareTask, startRun, approveRun, cancelRun, type CommandContext } from "../commands/task-commands.js";
+import { createGateway } from "../gateway/server.js";
+import type { TaskDetails, TaskRevision, Task } from "../shared/domain.js";
+import type { WorkflowStatus } from "../workflows/workflow-engine.js";
 
 function option(args:string[],name:string,required=true):string|undefined { const i=args.indexOf(`--${name}`); const value=i>=0?args[i+1]:undefined; if(required&&!value) throw new Error(`Missing --${name}`); return value; }
 function has(args:string[],name:string):boolean { return args.includes(`--${name}`); }
@@ -62,9 +66,11 @@ function parseProviderOverrides(args:string[]): Partial<Record<StepType,string>>
 }
 
 const args=process.argv.slice(2); if(args.includes("--help")||args.length===0) usage();
-const db=openDatabase(resolve(process.env.AGENTDOCK_DB??"./.agentdock/agentdock.db"));
+const dbPath=resolve(process.env.AGENTDOCK_DB??"./.agentdock/agentdock.db");
+const db=openDatabase(dbPath);
 try {
   const app=createApplication(db); const [resource,action]=args;
+  const commands:CommandContext={db,app,queue:new TaskQueue(db),outbox:new TransactionalOutbox(db),activity:app.activity,audit:app.audit};
   if(resource==="serve") {
     const telegramToken=process.env.TELEGRAM_BOT_TOKEN;
     const feishuAppId=process.env.FEISHU_APP_ID;
@@ -79,17 +85,24 @@ try {
     else if(feishuPort>0) { controller.register(new FeishuAdapter(feishuPort,undefined,process.env.FEISHU_VERIFICATION_TOKEN??null,()=>process.env.FEISHU_TENANT_TOKEN??null)); feishuMode = "feishu(webhook)"; }
     if((feishuAppId===undefined)!==(feishuAppSecret===undefined)) console.error("Warning: FEISHU_APP_ID and FEISHU_APP_SECRET must be set together; falling back.");
     // The orchestrator owns execution: leases, concurrency, timeouts, recovery.
-    const orchestrator=new Orchestrator(db,app,app.processRunner,{});
+    const orchestrator=new Orchestrator(db,app,app.processRunner,{activity:app.activity});
     controller.attachOrchestrator(orchestrator);
     // Outbox delivery: terminal run events notify the IM conversation that started the task.
     const dispatcher=new OutboxDispatcher(db,new TransactionalOutbox(db),(conversationId,text,adapter)=>controller.notify(conversationId,text,adapter),"serve-dispatcher");
     controller.attachNotifier(dispatcher);
+    // Local gateway for the workbench (loopback + bearer token); AGENTDOCK_GATEWAY=off disables it.
+    let gateway: ReturnType<typeof createGateway> | null = null;
+    if(process.env.AGENTDOCK_GATEWAY!=="off") {
+      gateway=createGateway({db,app,queue:orchestrator.queue,orchestrator,host:process.env.AGENTDOCK_GATEWAY_HOST??"127.0.0.1",port:Number(process.env.AGENTDOCK_GATEWAY_PORT??4173),dbPath});
+      const listening=await gateway.start();
+      console.log(`AgentDock gateway listening on ${listening.url} (token: ${listening.tokenSource})`);
+    }
     await controller.startAll();
     await orchestrator.start();
     await dispatcher.start();
     const adapters=[telegramToken?"telegram":null,feishuMode].filter(Boolean).join("+")||"no IM adapters configured";
     console.log(`AgentDock serving (${adapters}). Ctrl-C to stop.`);
-    const shutdown=async()=>{ await dispatcher.stop(); await orchestrator.stop(); await controller.stopAll(); db.close(); process.exit(0); };
+    const shutdown=async()=>{ if(gateway!==null) await gateway.stop(); await dispatcher.stop(); await orchestrator.stop(); await controller.stopAll(); db.close(); process.exit(0); };
     process.on("SIGINT",()=>{ void shutdown(); });
     process.on("SIGTERM",()=>{ void shutdown(); });
     await new Promise(()=>{});
@@ -106,22 +119,18 @@ try {
   else if(resource==="project"&&action==="list") console.log(JSON.stringify(app.projects.list(),null,2));
   else if(resource==="project"&&action==="set-status") console.log(JSON.stringify(app.projects.setStatus(option(args,"project-id")!,option(args,"status")!),null,2));
   else if(resource==="project"&&action==="validate") { const validation=await app.worktrees.validateProject(option(args,"project-id")!); console.log(JSON.stringify(validation,null,2)); if(!validation.ok) process.exitCode=1; }
-  else if(resource==="task"&&action==="create") console.log(JSON.stringify(app.tasks.create(option(args,"project-id")!,option(args,"request")!),null,2));
-  else if(resource==="task"&&action==="revise") console.log(JSON.stringify(app.tasks.revise(option(args,"task-id")!,option(args,"request")!),null,2));
+  else if(resource==="task"&&action==="create") console.log(JSON.stringify(await createTask(commands,{projectId:option(args,"project-id")!,request:option(args,"request")!,actor:"cli"}) as TaskDetails,null,2));
+  else if(resource==="task"&&action==="revise") console.log(JSON.stringify(await reviseTask(commands,{taskId:option(args,"task-id")!,request:option(args,"request")!,actor:"cli"}) as TaskRevision,null,2));
   else if(resource==="task"&&action==="list") console.log(JSON.stringify(app.tasks.list(option(args,"project-id",false)),null,2));
   else if(resource==="task"&&action==="show") console.log(JSON.stringify(app.tasks.show(option(args,"task-id")!),null,2));
-  else if(resource==="task"&&action==="prepare") console.log(JSON.stringify(await app.worktrees.prepare(option(args,"task-id")!),null,2));
+  else if(resource==="task"&&action==="prepare") console.log(JSON.stringify(await prepareTask(commands,{taskId:option(args,"task-id")!,actor:"cli"}) as Task,null,2));
   else if(resource==="task"&&action==="cleanup") console.log(JSON.stringify(await app.worktrees.cleanup(option(args,"task-id")!,{force:has(args,"force")}),null,2));
   else if(resource==="task"&&action==="status") console.log(JSON.stringify(await app.worktrees.status(option(args,"task-id")!),null,2));
   else if(resource==="task"&&action==="diff") console.log(await app.worktrees.diff(option(args,"task-id")!,{stat:has(args,"stat")}));
   else if(resource==="workflow"&&action==="start") {
-    // Start + enqueue commit atomically: a running serve must never see a
-    // QUEUED run without its queue entry (it would be recovered as an orphan).
-    const started=withImmediateTransaction(db,()=>{
-      const s=app.workflows.start({taskId:option(args,"task-id")!,preset:option(args,"preset")!,providers:parseProviderOverrides(args)});
-      new TaskQueue(db).enqueue(option(args,"task-id")!);
-      return s;
-    });
+    // Start + enqueue commit atomically (inside startRun): a running serve
+    // must never see a QUEUED run without its queue entry (orphan recovery).
+    const started=await startRun(commands,{taskId:option(args,"task-id")!,preset:option(args,"preset")!,providers:parseProviderOverrides(args),actor:"cli"}) as WorkflowStatus;
     console.log(JSON.stringify(started,null,2));
   }
   else if(resource==="workflow"&&action==="execute") {
@@ -131,7 +140,7 @@ try {
     const runId=option(args,"run-id")!;
     const row=db.prepare("SELECT tr.task_id AS taskId FROM workflow_runs wr JOIN task_revisions tr ON wr.task_revision_id = tr.id WHERE wr.id = ?").get(runId) as {taskId:string}|undefined;
     const taskId=row?.taskId??null;
-    const orchestrator=new Orchestrator(db,app,app.processRunner,{});
+    const orchestrator=new Orchestrator(db,app,app.processRunner,{activity:app.activity});
     const LEASE_TTL_MS=60_000;
     const claim=taskId!==null?orchestrator.claimInlineRun(taskId,runId,`cli-${process.pid}`,LEASE_TTL_MS):null;
     let leaseLost=false;
@@ -163,17 +172,10 @@ try {
   else if(resource==="workflow"&&action==="approve") {
     // Approve + enqueue atomically, mirroring the IM approval path.
     const runId=option(args,"run-id")!;
-    const approved=!has(args,"reject");
-    withImmediateTransaction(db,()=>{
-      app.workflows.approve(runId,approved);
-      if(approved) {
-        const row=db.prepare("SELECT tr.task_id AS taskId FROM workflow_runs wr JOIN task_revisions tr ON wr.task_revision_id = tr.id WHERE wr.id = ?").get(runId) as {taskId:string}|undefined;
-        if(row!==undefined) new TaskQueue(db).enqueue(row.taskId);
-      }
-    });
+    await approveRun(commands,{runId,approved:!has(args,"reject"),actor:"cli"});
     console.log(JSON.stringify(app.workflows.status(runId),null,2));
   }
-  else if(resource==="workflow"&&action==="cancel") console.log(JSON.stringify(app.workflows.cancel(option(args,"run-id")!),null,2));
+  else if(resource==="workflow"&&action==="cancel") console.log(JSON.stringify(await cancelRun(commands,{runId:option(args,"run-id")!,actor:"cli"}) as WorkflowStatus,null,2));
   else if(resource==="github"&&action==="create-pr") {
     const github=new GitHubService(db,new GhCliAdapter(),app.repositories.tasks,app.repositories.projects);
     console.log(JSON.stringify(await github.createDraftPr({taskId:option(args,"task-id")!,title:option(args,"title")!}),null,2));

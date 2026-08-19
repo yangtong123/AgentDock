@@ -26,7 +26,11 @@ AgentDock is a multi-project coding-agent orchestrator. It coordinates Claude Co
 ```bash
 npm install
 npm run build
+npm --prefix workbench install   # workbench deps (needed for the browser UI)
+npm run build:workbench          # builds workbench/dist served by the gateway
 ```
+
+Without `build:workbench` the gateway still serves the REST API, but the workbench page returns 404 ("workbench is not built").
 
 ## Quick start
 

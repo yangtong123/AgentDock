@@ -235,6 +235,13 @@ export class ImController {
           }
           return respond(`Task ${command.taskId} is ${task.state}; nothing to stop.`);
         }
+        case "WATCH_TASK": {
+          const task = this.app.tasks.list().find((t) => t.id === command.taskId);
+          if (!task) return respond(`Unknown task: ${command.taskId}`);
+          this.trackTaskInterest(command.conversationId, task.id, this.originAdapterOf(command.conversationId) ?? null);
+          const run = this.activeRunFor(command.taskId);
+          return respond(`Subscribed to task ${task.id} (${task.state})${run ? ` · run ${run.run.id} (${run.run.state})` : ""}. Notifications will be delivered to this conversation.`);
+        }
         case "APPROVE_RUN": {
           if (!command.approved) {
             // Reject goes through the shared command handler: audit + activity included.

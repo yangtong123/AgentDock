@@ -27,6 +27,12 @@ AgentDock is a multi-project coding-agent orchestrator. It coordinates coding ag
 
 ## Current status
 
-All roadmap milestones through **V1.0 — Stable Daily Driver** are implemented (see `docs/ROADMAP.md`).
+All roadmap milestones through **V1.0 — Stable Daily Driver** and **V1.1 — Cross-Agent Workbench** are implemented, hardened, and verified (see `docs/ROADMAP.md`, `docs/tasks/V1.1-CROSS-AGENT-WORKBENCH.md`, and `docs/tasks/v1.1-release-checklist.md`).
 
-**V1.1 — Cross-Agent Workbench** is code-complete with all real-environment acceptance runs passed (see `docs/tasks/V1.1-CROSS-AGENT-WORKBENCH.md` and `docs/tasks/v1.1-release-checklist.md`). All five milestones are implemented: the local gateway (`src/gateway/`, REST + SSE on `127.0.0.1:4173` with a Bearer token, started by `agentdock serve`), the durable activity stream (`src/activity/`), shared command handlers (`src/commands/`) used by CLI, IM, and HTTP, the browser workbench (`workbench/`, React + Vite, served by the gateway) with task composer and desktop controls, and cross-channel continuity with normalized actors. Acceptance evidence (2026-08-19): single-provider, both Claude×Codex directions, and cross-channel continuity both ways — desktop-started `careful` run approved from Feishu, Feishu-started run observed live on desktop. Remaining: release mechanics only (commit, CI green on main, README quick-start verification), plus optional hardening of two acceptance findings: `git` fails inside the macOS seatbelt write-jail (`/dev/null` not permitted), and desktop-started tasks notify no IM conversation until the first IM interaction subscribes it.
+**V1.1 Highlights**:
+- Local gateway (`src/gateway/`, REST + SSE on `127.0.0.1:4173` with Bearer token authentication).
+- Durable activity stream (`src/activity/`) and shared command handlers (`src/commands/`) across CLI, IM, and HTTP.
+- Interactive browser workbench (`workbench/`, React + Vite) with task composer, per-step provider assignment, live virtualized logs, per-file diffs, structured findings, and desktop controls.
+- Cross-channel continuity: phone IM and browser operate the same task model; `/watch` command allows explicit task subscription.
+- Hardened macOS Seatbelt write-jail with `/dev/null` allowance.
+- Real-environment acceptance passed for all provider permutations (All Claude, Claude build / Codex review, Codex build / Claude review) and bidirectional cross-channel controls.

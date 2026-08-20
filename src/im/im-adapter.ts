@@ -10,6 +10,7 @@ export type ImCommand =
   | { type: "LIST_TASKS"; conversationId: string }
   | { type: "TASK_STATUS"; conversationId: string; taskId: string }
   | { type: "STOP_TASK"; conversationId: string; taskId: string }
+  | { type: "WATCH_TASK"; conversationId: string; taskId: string }
   | { type: "APPROVE_RUN"; conversationId: string; runId: string; approved: boolean }
   | { type: "CONTINUE_RUN"; conversationId: string; runId: string }
   | { type: "VIEW_DIFF"; conversationId: string; taskId: string; statOnly: boolean };

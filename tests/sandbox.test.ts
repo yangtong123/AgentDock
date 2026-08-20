@@ -107,6 +107,8 @@ test("layer 2: seatbelt profile denies writes outside allowlisted paths", () => 
   assert.match(sbProfile, new RegExp(`subpath "${worktree}"`));
   // Network is allowed at the OS layer: the agent CLI's model-API traffic needs it.
   assert.match(sbProfile, /allow network\*/);
+  // /dev/null is writable for subprocesses like git.
+  assert.match(sbProfile, /allow file-write\* \(literal "\/dev\/null"\)/);
   // No macOS system brokers: mach-lookup to trustd/securityd/configd etc. would
   // give a compromised agent XPC access to credential-adjacent services. Codex
   // gets TLS roots via SSL_CERT_FILE instead (see CodexAgent).
@@ -174,6 +176,12 @@ test("layer 2 (integration): sandbox-exec blocks a write outside the worktree", 
   const profile = PROFILES["restricted"]!;
   const writeScript = (target: string) => [process.execPath, "-e", "require('fs').writeFileSync(process.argv[1], 'x')", target];
   const sandboxed = (target: string) => OsSandbox.plan(profile, worktree, writeScript(target)).argv;
+  // Check if sandbox-exec is permitted in the current execution environment (e.g. not running nested in another restricted sandbox)
+  const probe = await runner.run({ cwd: worktree, argv: ["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"], env: { PATH: process.env.PATH! }, timeoutMs: 5_000 }).catch(() => null);
+  if (probe === null || probe.exitCode !== 0) {
+    rmSync(base, { recursive: true, force: true });
+    return; // host/nested container environment blocks sandbox_apply
+  }
   try {
     // Sandboxed write outside the worktree: must fail and leave no file.
     const outsideTarget = join(outside, "escaped.txt");

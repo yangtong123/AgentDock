@@ -85,6 +85,7 @@ export class OsSandbox {
 (allow sysctl-read)
 (allow file-read*)
 (allow network*)
+(allow file-write* (literal "/dev/null"))
 ${writeRules}
   ;; SBPL: later rules win — the config-file deny must come after the allows.
   (deny file-write* (literal "${this.escape(this.normalize(`${home}/.codex/config.toml`))}"))

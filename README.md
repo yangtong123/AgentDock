@@ -1,18 +1,19 @@
 # AgentDock
 
-AgentDock is a multi-project coding-agent orchestrator. It coordinates Claude Code and Codex as interchangeable providers across durable tasks, isolated Git worktrees, configurable workflows, deterministic verification, bounded review/fix loops, and human approval gates — controlled from Telegram, Feishu/Lark, or the local CLI.
+AgentDock is a multi-project coding-agent orchestrator. It coordinates Claude Code and Codex as interchangeable providers across durable tasks, isolated Git worktrees, configurable workflows, deterministic verification, bounded review/fix loops, and human approval gates — controlled from the browser workbench, Telegram, Feishu/Lark, or the local CLI.
 
-**Status: V1.0** — all roadmap milestones through V1.0 are implemented. See [the roadmap](docs/ROADMAP.md).
+**Status: V1.1 — Cross-Agent Workbench** — all roadmap milestones through V1.1 are implemented and verified. See [the roadmap](docs/ROADMAP.md) and [the V1.1 task document](docs/tasks/V1.1-CROSS-AGENT-WORKBENCH.md).
 
 ## What it does
 
+- **Interactive Desktop Workbench (V1.1)**: React + Vite web UI served directly by `agentdock serve`. Task composer, per-step provider assignment, live virtualized log streaming, per-file diffs, structured review findings, and desktop controls.
 - **Multiple projects and tasks** with durable state in SQLite; every task runs in an isolated Git worktree (`agentdock/<task-id>` branch).
 - **Claude Code and Codex as providers**, configurable per workflow step. Session resume with fallback to durable task context when a session is lost.
 - **Workflows**: `fast` (implement → verify), `cross-review` (implement → verify → review → fix loop → final review), `careful` (adds plan + human approval gates), and `fix` (re-entry for CI/review failures). Bounded review/fix loops with `maxReviewRounds`.
 - **Deterministic verification** outranks LLM review: projects declare a verify command (argv array) that the VERIFY step executes in the worktree.
-- **Reliability**: worker leases and heartbeats, task queue with priority/scheduling and global/per-project concurrency, owner-scoped process-tree cancellation, task timeouts, orphan recovery, transactional outbox with lease-based delivery, idempotent IM commands.
-- **Human approval gates** with interactive approve/reject buttons in Telegram and Feishu.
-- **Telegram + Feishu/Lark** share one domain control model: a task created in one IM is visible and controllable from the other.
+- **Reliability**: worker leases and heartbeats, task queue with priority/scheduling and global/per-project concurrency, owner-scoped process-tree cancellation, task timeouts, orphan recovery, transactional outbox with lease-based delivery, idempotent commands across all surfaces.
+- **Human approval gates** with interactive approve/reject buttons in the workbench, Telegram, and Feishu.
+- **Cross-channel continuity**: a task belongs to AgentDock. Start on desktop, approve from phone, watch progress on desktop. Explicit `/watch <task-id>` subscription command for IM.
 - **GitHub**: branch push, Draft PR (never auto-merges), CI status, CI-failure and PR-review ingestion feeding fix workflows.
 - **Security**: agent sandboxes (provider-native permission modes + OS-level write jail), secret isolation, permission profiles, audit log; observability with metrics, usage/duration tracking, and per-task budget caps.
 
@@ -33,6 +34,18 @@ npm run build:workbench          # builds workbench/dist served by the gateway
 Without `build:workbench` the gateway still serves the REST API, but the workbench page returns 404 ("workbench is not built").
 
 ## Quick start
+
+### 1. Interactive Desktop Workbench
+
+```bash
+# Start the server (includes local gateway on 127.0.0.1:4173)
+npm run cli -- serve
+
+# Open the gateway URL in your browser:
+# http://127.0.0.1:4173/?token=<token-from-.agentdock/gateway-token>
+```
+
+### 2. Local CLI
 
 ```bash
 # 1. Register a project (verify command is optional but recommended)
@@ -71,7 +84,7 @@ Feishu has two transports; the long-connection one is the simple mode (no public
 - **Long connection (recommended)**: set `FEISHU_APP_ID` + `FEISHU_APP_SECRET`. In the developer console enable the bot capability, grant `im:message` + `im:message:send_as_bot`, subscribe `im.message.receive_v1`, select **long connection (长连接)** as the delivery mode, and publish the app. Note: the SDK's long connection does not deliver card callbacks, so approval prompts arrive as text — reply `/approve RUN_ID` or `/reject RUN_ID`.
 - **Webhook**: set `FEISHU_WEBHOOK_PORT` (plus `FEISHU_VERIFICATION_TOKEN` and `FEISHU_TENANT_TOKEN`) and point the event subscription URL and the card callback URL (回调配置 → 卡片回传交互) at the server. The webhook transport renders interactive approve/reject cards; also subscribe `card.action.trigger`.
 
-IM commands: `/projects`, `/providers`, `/use NAME`, `/new REQUEST`, `/run TASK PRESET [STEP=provider ...]`, `/tasks`, `/status TASK`, `/diff TASK`, `/stop TASK`, `/approve RUN_ID`, `/reject RUN_ID`, plus interactive approve/reject buttons at approval gates (Telegram and Feishu webhook). Restrict access with `ALLOWED_CHAT_IDS` (Telegram) / `FEISHU_ALLOWED_CHAT_IDS` and verify Feishu webhooks with `FEISHU_VERIFICATION_TOKEN`.
+IM commands: `/projects`, `/providers`, `/use NAME`, `/new REQUEST`, `/run TASK PRESET [STEP=provider ...]`, `/tasks`, `/status TASK`, `/watch TASK`, `/diff TASK`, `/stop TASK`, `/approve RUN_ID`, `/reject RUN_ID`, plus interactive approve/reject buttons at approval gates (Telegram and Feishu webhook). Restrict access with `ALLOWED_CHAT_IDS` (Telegram) / `FEISHU_ALLOWED_CHAT_IDS` and verify Feishu webhooks with `FEISHU_VERIFICATION_TOKEN`.
 
 ## Agent sandboxing
 

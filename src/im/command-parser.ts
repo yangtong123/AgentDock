@@ -59,6 +59,10 @@ export function parseCommand(conversationId: string, text: string): ImCommand | 
     case "/stop":
       if (!argument) return null;
       return { type: "STOP_TASK", conversationId, taskId: argument };
+    case "/watch":
+    case "/subscribe":
+      if (!argument) return null;
+      return { type: "WATCH_TASK", conversationId, taskId: argument };
     case "/approve": {
       const runId = rest[0] ?? "";
       if (!runId) return null;

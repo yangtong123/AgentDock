@@ -20,6 +20,9 @@ test("parser maps /commands to domain commands and ignores chat", () => {
   assert.deepEqual(parseCommand(conversationId, "/tasks"), { type: "LIST_TASKS", conversationId });
   assert.deepEqual(parseCommand(conversationId, "/status t1"), { type: "TASK_STATUS", conversationId, taskId: "t1" });
   assert.deepEqual(parseCommand(conversationId, "/stop t1"), { type: "STOP_TASK", conversationId, taskId: "t1" });
+  assert.deepEqual(parseCommand(conversationId, "/watch t1"), { type: "WATCH_TASK", conversationId, taskId: "t1" });
+  assert.deepEqual(parseCommand(conversationId, "/subscribe t1"), { type: "WATCH_TASK", conversationId, taskId: "t1" });
+  assert.equal(parseCommand(conversationId, "/watch"), null);
   assert.deepEqual(parseCommand(conversationId, "/diff t1 --stat"), { type: "VIEW_DIFF", conversationId, taskId: "t1", statOnly: true });
   assert.deepEqual(parseCommand(conversationId, "/approve r1"), { type: "APPROVE_RUN", conversationId, runId: "r1", approved: true });
   assert.deepEqual(parseCommand(conversationId, "/reject r1"), { type: "APPROVE_RUN", conversationId, runId: "r1", approved: false });
@@ -277,5 +280,44 @@ test("controller: notify never broadcasts to adapters that have not seen the con
     await f.controller.notify("legacy-1", "hi", null);
     assert.equal(feishu.delivered.filter((reply) => reply.text === "hi").length, 1);
     assert.equal(telegram.delivered.filter((reply) => reply.text === "hi").length, 0);
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("controller: /watch subscribes an IM conversation to a task without prior IM interaction", async () => {
+  const f = controllerFixture();
+  try {
+    const telegram = fakeAdapter("telegram");
+    f.controller.register(telegram);
+    // Simulating a task created externally (e.g. from the desktop workbench)
+    const project = f.app.projects.create({ name: "demo", repoPath: f.repo, worktreeRoot: join(f.base, "wt") });
+    const taskDetails = f.app.tasks.create(project.id, "desktop task");
+    const taskId = taskDetails.task.id;
+
+    // Unknown task returns a clear error
+    const notFound = await f.controller.handle({ type: "WATCH_TASK", conversationId: "chat-42", taskId: "missing-id" }, "telegram");
+    assert.match(notFound.text, /Unknown task: missing-id/);
+
+    // Watch an existing task
+    const reply = await f.controller.handle({ type: "WATCH_TASK", conversationId: "chat-42", taskId }, "telegram");
+    assert.match(reply.text, /Subscribed to task/);
+    assert.match(reply.text, new RegExp(taskId));
+
+    // Confirm notification is received by the subscribed conversation via dispatcher
+    const outbox = new (await import("../src/reliability/outbox.js")).TransactionalOutbox(f.db);
+    const dispatcher = new (await import("../src/reliability/outbox-dispatcher.js")).OutboxDispatcher(
+      f.db,
+      outbox,
+      (convId, text, adapter) => f.controller.notify(convId, text, adapter),
+      "test-dispatcher",
+    );
+    f.controller.attachNotifier(dispatcher);
+
+    // Re-watch to register in the attached dispatcher
+    await f.controller.handle({ type: "WATCH_TASK", conversationId: "chat-42", taskId }, "telegram");
+
+    outbox.publish({ taskId, type: "run.succeeded", payload: { taskId, runId: "r-999" } });
+    await dispatcher.drainOnce();
+
+    assert.equal(telegram.delivered.some((msg) => msg.conversationId === "chat-42" && msg.text.includes("finished: SUCCEEDED")), true);
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });

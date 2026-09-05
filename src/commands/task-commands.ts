@@ -45,7 +45,12 @@ export function isReplayed(result: unknown): result is Replayed {
  * runs and carries the JSON response afterwards. A claimed row without a
  * response means a concurrent request is still in flight. Failures release
  * the key so the request stays retryable (same rule as Orchestrator.once).
+ * A claim left answerless past CLAIM_STALE_MS is a crash artifact (the
+ * process died between claim and response) and is reclaimed: without this,
+ * such a key would answer "request in progress" forever.
  */
+const CLAIM_STALE_MS = 15 * 60_000;
+
 async function idempotent<T>(ctx: CommandContext, key: string | undefined, fn: () => Promise<T>): Promise<T | Replayed> {
   if (key === undefined) return fn();
   const dedup = new CommandDedup(ctx.db);
@@ -53,7 +58,10 @@ async function idempotent<T>(ctx: CommandContext, key: string | undefined, fn: (
   if (!dedup.claim(commandKey)) {
     const existing = dedup.lookup(commandKey);
     if (existing.response !== null) return { replayed: true, response: JSON.parse(existing.response) };
-    throw new StateConflictError(`request in progress`);
+    const staleBefore = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
+    if (!dedup.reclaimIfStale(commandKey, staleBefore) || !dedup.claim(commandKey)) {
+      throw new StateConflictError(`request in progress`);
+    }
   }
   try {
     const value = await fn();
@@ -156,7 +164,7 @@ export async function startRun(ctx: CommandContext, input: {
   });
 }
 
-export async function approveRun(ctx: CommandContext, input: { runId: string; approved: boolean; expectedRunState?: string } & CommandCall): Promise<WorkflowStatus | Replayed> {
+export async function approveRun(ctx: CommandContext, input: { runId: string; approved: boolean; expectedRunState?: string; expectedApprovalStepId?: string } & CommandCall): Promise<WorkflowStatus | Replayed> {
   return idempotent(ctx, input.idempotencyKey, () => {
     const taskId = taskIdForRun(ctx.db, input.runId);
     // Approve + re-enqueue commit atomically (approval.decided is recorded by
@@ -164,6 +172,15 @@ export async function approveRun(ctx: CommandContext, input: { runId: string; ap
     // transaction so a concurrent decision cannot slip between check and act.
     const status = withImmediateTransaction(ctx.db, () => {
       requireRunState(ctx, input.runId, input.expectedRunState);
+      // Bind the decision to the gate the caller saw: runs park at RUNNING
+      // at every gate, so expectedRunState alone cannot tell a stale gate-1
+      // request from a fresh gate-2 one. A mismatch is a stale view.
+      if (input.expectedApprovalStepId !== undefined) {
+        const pending = ctx.app.workflows.pendingApprovalGate(input.runId);
+        if (pending === null || pending.id !== input.expectedApprovalStepId) {
+          throw new StateConflictError(`WorkflowRun ${input.runId} is awaiting gate ${pending?.id ?? "none"}, not ${input.expectedApprovalStepId}`);
+        }
+      }
       const s = ctx.app.workflows.approve(input.runId, input.approved, { actor: input.actor });
       if (input.approved && taskId !== null) ctx.queue.enqueue(taskId);
       // Reject cancels a parked run: no worker is executing, so nobody else

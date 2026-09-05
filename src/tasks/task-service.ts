@@ -14,11 +14,16 @@ export class TaskService {
     const revision:TaskRevision={id:randomUUID(),taskId:task.id,revision:1,request:request.trim(),createdAt:timestamp};
     this.tasks.createWithRevision(task,revision); return {task,currentRevision:revision,revisions:[revision]};
   }
+  /** New revision = new work requested. A terminal task reopens to READY so a
+   *  follow-up revision can start a fresh run (runs stay pinned to old revisions).
+   *  RUNNING/CANCEL_REQUESTED tasks keep their state: the in-flight run owns it. */
   revise(taskId:string,request:string):TaskRevision {
     if(!request.trim()) throw new ValidationError("request is required");
     const task=this.tasks.findById(taskId); if(!task) throw new NotFoundError(`Task ${taskId} not found`);
     const timestamp=this.now(); const revision:TaskRevision={id:randomUUID(),taskId,revision:task.currentRevision+1,request:request.trim(),createdAt:timestamp};
-    this.tasks.addRevision(taskId,revision,timestamp); return revision;
+    this.tasks.addRevision(taskId,revision,timestamp);
+    if(task.state==="SUCCEEDED"||task.state==="FAILED"||task.state==="CANCELLED") this.tasks.update(taskId,{state:"READY"},timestamp);
+    return revision;
   }
   show(taskId:string):TaskDetails { const task=this.tasks.findById(taskId); if(!task) throw new NotFoundError(`Task ${taskId} not found`); const revisions=this.tasks.listRevisions(taskId); const currentRevision=revisions.find(r=>r.revision===task.currentRevision); if(!currentRevision) throw new Error("Task has no current revision"); return {task,currentRevision,revisions}; }
   list(projectId?:string):Task[] { return this.tasks.list(projectId); }

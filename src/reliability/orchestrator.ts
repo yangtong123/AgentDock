@@ -150,18 +150,25 @@ export class Orchestrator {
   /**
    * Self-healing approval notifications: a run parked at a QUEUED
    * HUMAN_APPROVAL gate whose earlier steps all SUCCEEDED must have an
-   * approval.requested outbox event. runTask publishes it when execute()
-   * returns parked, but a crash in between loses it (parked runs are never
-   * re-executed) — this sweep republishes exactly the missing ones.
+   * approval.requested outbox event for THAT gate. runTask publishes it when
+   * execute() returns parked, but a crash in between loses it (parked runs
+   * are never re-executed) — this sweep republishes exactly the missing
+   * ones. Dedup is per gate (payload.gateStepId), not per run: a run with
+   * two gates that already notified for the first must still notify for the
+   * second. Legacy events without gateStepId never match and are re-sent —
+   * at-least-once delivery is the contract, duplicates are tolerated.
    */
   notifyParkedApprovalGates(): number {
-    const rows = this.db.prepare(`SELECT r.id AS runId, tr.task_id AS taskId
-      FROM workflow_runs r JOIN task_revisions tr ON r.task_revision_id = tr.id
-      WHERE r.state IN ('QUEUED','RUNNING')
-        AND EXISTS (SELECT 1 FROM step_runs g WHERE g.workflow_run_id = r.id AND g.step_type = 'HUMAN_APPROVAL' AND g.state = 'QUEUED'
-                    AND NOT EXISTS (SELECT 1 FROM step_runs p WHERE p.workflow_run_id = r.id AND p.sequence < g.sequence AND p.state NOT IN ('SUCCEEDED')))
-        AND NOT EXISTS (SELECT 1 FROM outbox_events o WHERE o.workflow_run_id = r.id AND o.type = 'approval.requested')`).all() as { runId: string; taskId: string }[];
-    for (const row of rows) this.outbox.publish({ taskId: row.taskId, workflowRunId: row.runId, type: "approval.requested", payload: { taskId: row.taskId, runId: row.runId } });
+    const rows = this.db.prepare(`SELECT runId, gateId, taskId FROM (
+        SELECT r.id AS runId, tr.task_id AS taskId, g.id AS gateId
+        FROM workflow_runs r
+        JOIN task_revisions tr ON r.task_revision_id = tr.id
+        JOIN step_runs g ON g.workflow_run_id = r.id AND g.step_type = 'HUMAN_APPROVAL' AND g.state = 'QUEUED'
+        WHERE r.state IN ('QUEUED','RUNNING')
+          AND NOT EXISTS (SELECT 1 FROM step_runs p WHERE p.workflow_run_id = r.id AND p.sequence < g.sequence AND p.state NOT IN ('SUCCEEDED'))
+          AND NOT EXISTS (SELECT 1 FROM outbox_events o WHERE o.workflow_run_id = r.id AND o.type = 'approval.requested'
+                          AND json_extract(o.payload, '$.gateStepId') = g.id))`).all() as { runId: string; gateId: string; taskId: string }[];
+    for (const row of rows) this.outbox.publish({ taskId: row.taskId, workflowRunId: row.runId, type: "approval.requested", payload: { taskId: row.taskId, runId: row.runId, gateStepId: row.gateId } });
     return rows.length;
   }
 
@@ -316,7 +323,11 @@ export class Orchestrator {
       if (status.awaitingApproval) {
         // Approval gates notify subscribed conversations through the outbox
         // (the engine records the activity event; delivery is outbox machinery).
-        this.outbox.publish({ taskId, workflowRunId: activeRun, type: "approval.requested", payload: { taskId, runId: activeRun } });
+        // gateStepId keys the notification to THIS gate: the crash-recovery
+        // sweep below republishes per gate, not per run — a second gate must
+        // not be silenced by the first gate's delivered notification.
+        const gateStepId = this.app.workflows.pendingApprovalGate(activeRun)?.id ?? null;
+        this.outbox.publish({ taskId, workflowRunId: activeRun, type: "approval.requested", payload: { taskId, runId: activeRun, gateStepId } });
       }
       this.outbox.publish({ taskId, workflowRunId: activeRun, type: `run.${status.run.state.toLowerCase()}`, payload: { taskId, runId: activeRun, state: status.run.state } });
     } catch (error) {

@@ -137,7 +137,9 @@ export class AgentThreadManager {
     return { thread, outcome, failure, artifacts: captured };
   }
 
-  /** Creates stdout/stderr artifact rows up front and appends process chunks as they arrive. */
+  /** Creates stdout/stderr artifact rows up front and appends process chunks as they arrive.
+   *  Files are scoped to thread + step: a RESUME thread serves several steps
+   *  (multi-round FIX/REVIEW) and each step's artifact must keep its own log. */
   private openStreamArtifacts(thread: AgentThread, runIds: { workflowRunId: string | null; stepRunId: string | null }): {
     onStdout: (chunk: string) => void;
     onStderr: (chunk: string) => void;
@@ -146,9 +148,9 @@ export class AgentThreadManager {
   } {
     const recordedAt = this.now();
     const streams = (["agent-stdout", "agent-stderr"] as const).map((kind) => {
-      const path = join(this.artifactRoot, thread.id, `${kind}.txt`);
+      const path = this.logPath(thread.id, runIds.stepRunId, `${kind}.txt`);
       mkdirSync(dirname(path), { recursive: true });
-      const artifact = this.artifacts.create({ id: randomUUID(), taskId: thread.taskId, workflowRunId: runIds.workflowRunId, stepRunId: runIds.stepRunId, kind, name: `${thread.provider}-${thread.role}-${kind}`, storage: { type: "FILE", path }, createdAt: recordedAt });
+      const artifact = this.artifacts.create({ id: randomUUID(), taskId: thread.taskId, workflowRunId: runIds.workflowRunId, stepRunId: runIds.stepRunId, kind, name: this.artifactName(thread, kind, runIds.stepRunId), storage: { type: "FILE", path }, createdAt: recordedAt });
       return { kind, artifact, fd: openSync(path, "a"), streamed: 0 };
     });
     const sink = (kind: "agent-stdout" | "agent-stderr") => (chunk: string) => {
@@ -180,13 +182,23 @@ export class AgentThreadManager {
     const created: Artifact[] = [];
     const persist = (kind: string, name: string, content: string): void => {
       // stdout/stderr go to FILE storage — agent transcripts are too large for the DB row.
-      const path = join(this.artifactRoot, thread.id, `${kind}${suffix}.txt`);
+      const path = this.logPath(thread.id, runIds?.stepRunId ?? null, `${kind}${suffix}.txt`);
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, content, "utf8");
-      created.push(this.artifacts.create({ id: randomUUID(), taskId: thread.taskId, workflowRunId: runIds?.workflowRunId ?? null, stepRunId: runIds?.stepRunId ?? null, kind, name: `${thread.provider}-${thread.role}-${kind}${suffix}`, storage: { type: "FILE", path }, createdAt: recordedAt }));
+      created.push(this.artifacts.create({ id: randomUUID(), taskId: thread.taskId, workflowRunId: runIds?.workflowRunId ?? null, stepRunId: runIds?.stepRunId ?? null, kind, name: this.artifactName(thread, kind, runIds?.stepRunId ?? null) + suffix, storage: { type: "FILE", path }, createdAt: recordedAt }));
     };
     if (outcome.stdout) persist("agent-stdout", "stdout", outcome.stdout);
     if (outcome.stderr) persist("agent-stderr", "stderr", outcome.stderr);
     return created;
+  }
+
+  /** One log file per thread + step: later steps on the same RESUME thread never overwrite earlier ones. */
+  private logPath(threadId: string, stepRunId: string | null, fileName: string): string {
+    return stepRunId === null ? join(this.artifactRoot, threadId, fileName) : join(this.artifactRoot, threadId, stepRunId, fileName);
+  }
+
+  private artifactName(thread: AgentThread, kind: string, stepRunId: string | null): string {
+    const stepSuffix = stepRunId === null ? "" : `-${stepRunId.slice(0, 8)}`;
+    return `${thread.provider}-${thread.role}-${kind}${stepSuffix}`;
   }
 }

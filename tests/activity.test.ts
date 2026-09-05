@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { openDatabase } from "../src/db/database.js";
+import { openDatabase, withImmediateTransaction } from "../src/db/database.js";
 import { createApplication } from "../src/app/application.js";
 import { createRepository } from "./helpers.js";
 import { ActivityLog, ACTIVITY_EVENTS } from "../src/activity/activity-log.js";
@@ -119,4 +119,25 @@ test("careful preset records approval.requested and approval.decided", async () 
     types = events.map((e) => e.type);
     assert.ok(types.indexOf("approval.decided") > types.indexOf("approval.requested"));
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); delete process.env.AGENTDOCK_ARTIFACTS; }
+});
+
+test("pokes defer until COMMIT and never fire for rolled-back events", () => {
+  const db = openDatabase(":memory:");
+  try {
+    const log = new ActivityLog(db);
+    let pokes = 0;
+    log.onPoke(() => { pokes++; });
+    withImmediateTransaction(db, () => log.record({ type: ACTIVITY_EVENTS.taskCreated, taskId: "t1", payload: {} }));
+    assert.equal(pokes, 1, "poke fires only after COMMIT");
+    assert.throws(() => withImmediateTransaction(db, () => {
+      log.record({ type: ACTIVITY_EVENTS.taskRevised, taskId: "t1", payload: {} });
+      throw new Error("boom");
+    }), /boom/);
+    assert.equal(pokes, 1, "a rolled-back event must not poke (an in-process SSE poll would read uncommitted rows, send them, and advance its cursor past ids the rollback frees)");
+    assert.equal(log.listSince(0, 100).filter((e) => e.type === "task.revised").length, 0);
+    // The freed id is reusable: the next committed event is visible and pokes.
+    withImmediateTransaction(db, () => log.record({ type: ACTIVITY_EVENTS.taskRevised, taskId: "t1", payload: {} }));
+    assert.equal(pokes, 2);
+    assert.equal(log.listSince(0, 100).filter((e) => e.type === "task.revised").length, 1);
+  } finally { db.close(); }
 });

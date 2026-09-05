@@ -213,7 +213,7 @@ export class WorkflowEngine {
     // Only the *pending* gate can be decided: every earlier step must have
     // SUCCEEDED (same predicate as status().awaitingApproval). Approving a
     // future gate mid-run would silently waive review before the work exists.
-    const gate = steps.find((step) => step.stepType === "HUMAN_APPROVAL" && step.state === "QUEUED" && steps.slice(0, step.sequence).every((earlier) => earlier.state === "SUCCEEDED"));
+    const gate = this.pendingGateIn(steps);
     if (!gate) throw new StateConflictError(`WorkflowRun ${runId} has no pending approval gate`);
     const { task } = this.contextForRun(runId);
     const timestamp = this.now();
@@ -254,8 +254,18 @@ export class WorkflowEngine {
   status(runId: string): WorkflowStatus {
     const run = this.requireRun(runId);
     const steps = this.workflows.listSteps(runId);
-    const awaitingApproval = !isTerminal(run.state) && steps.some((step) => step.stepType === "HUMAN_APPROVAL" && step.state === "QUEUED" && steps.slice(0, step.sequence).every((earlier) => earlier.state === "SUCCEEDED"));
+    const awaitingApproval = !isTerminal(run.state) && this.pendingGateIn(steps) !== undefined;
     return { run, steps, awaitingApproval };
+  }
+
+  /** The gate a decision would act on right now, or null (single source for approve/status and for callers binding a decision to the gate they saw). */
+  pendingApprovalGate(runId: string): StepRun | null {
+    return this.pendingGateIn(this.workflows.listSteps(runId)) ?? null;
+  }
+
+  /** QUEUED HUMAN_APPROVAL whose every earlier step SUCCEEDED. */
+  private pendingGateIn(steps: StepRun[]): StepRun | undefined {
+    return steps.find((step) => step.stepType === "HUMAN_APPROVAL" && step.state === "QUEUED" && steps.slice(0, step.sequence).every((earlier) => earlier.state === "SUCCEEDED"));
   }
 
   private async executeStep(runId: string, step: StepRun, task: Task, revision: TaskRevision, openFindings: ReviewFinding[], threads: Map<string, string>, stepTimeoutMs: number): Promise<{ state: "SUCCEEDED" | "FAILED" | "PAUSED"; paused?: boolean; review?: { findings: ReviewFinding[]; verdict: "PASS" | "NEEDS_FIXES" } }> {

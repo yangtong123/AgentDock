@@ -2,14 +2,18 @@ import { useEffect, useState } from "react";
 import { apiGet, apiPost } from "../api";
 import type { PresetsResponse, RunStatus, TaskDetails, TaskRevision } from "../types";
 import { assignmentFromSteps, swapAssignment, type ProviderAssignment } from "../lib/providers";
+import { pendingApprovalGateId } from "../lib/steps";
 import { useMutation } from "../lib/use-mutation";
 
 /**
  * Desktop controls over the shared command layer. Every button is one user
  * intent = one idempotency key (see useMutation); mutations send the run state
  * currently displayed (expectedRunState) so a stale view 409s instead of acting.
+ * Approval decisions additionally bind to the displayed gate
+ * (expectedApprovalStepId): runs park at RUNNING at every gate, so the state
+ * alone cannot tell a stale gate-1 request from a fresh gate-2 one.
  */
-export function RunControls({ details, run, onChanged }: { details: TaskDetails; run: RunStatus | null; onChanged: () => void }) {
+export function RunControls({ details, run, onChanged, onRunCreated }: { details: TaskDetails; run: RunStatus | null; onChanged: () => void; onRunCreated?: (runId: string) => void }) {
   const task = details.task;
   const [presets, setPresets] = useState<string[]>([]);
   const [startOpen, setStartOpen] = useState(false);
@@ -29,16 +33,22 @@ export function RunControls({ details, run, onChanged }: { details: TaskDetails;
 
   const viewedRunId = run?.run.id ?? null;
   const viewedRunState = run?.run.state ?? null;
+  const pendingGateId = run !== null && run.awaitingApproval ? pendingApprovalGateId(run.steps) : null;
   const requireRun = (): { runId: string; expectedRunState: string } => {
     if (viewedRunId === null || viewedRunState === null) throw new Error("no run loaded");
     return { runId: viewedRunId, expectedRunState: viewedRunState };
+  };
+  /** Follows a newly created run so the view shows Cancel (not a stale Retry). */
+  const followRun = (status: unknown): void => {
+    const createdRunId = (status as { run?: { id?: unknown } } | null)?.run?.id;
+    if (typeof createdRunId === "string") onRunCreated?.(createdRunId);
   };
 
   const prepare = useMutation((_args: void, key) => apiPost(`/tasks/${task.id}/prepare`, {}, key), onChanged);
   const start = useMutation((args: { preset: string; providers: ProviderAssignment }, key) => apiPost(`/tasks/${task.id}/runs`, args, key), onChanged);
   const approve = useMutation((args: { approved: boolean }, key) => {
     const { runId, expectedRunState } = requireRun();
-    return apiPost(`/runs/${runId}/${args.approved ? "approve" : "reject"}`, { expectedRunState }, key);
+    return apiPost(`/runs/${runId}/${args.approved ? "approve" : "reject"}`, { expectedRunState, ...(pendingGateId !== null ? { expectedApprovalStepId: pendingGateId } : {}) }, key);
   }, onChanged);
   const cancel = useMutation((_args: void, key) => {
     const { runId, expectedRunState } = requireRun();
@@ -55,7 +65,9 @@ export function RunControls({ details, run, onChanged }: { details: TaskDetails;
   const currentAssignment = run !== null ? assignmentFromSteps(run.steps) : {};
   const hasForeignProviders = Object.values(currentAssignment).some((provider) => provider !== "claude" && provider !== "codex");
   const canRetry = run !== null && (run.run.state === "FAILED" || run.run.state === "CANCELLED");
-  const canRerunAfterRevise = task.state === "READY" || task.state === "FAILED" || task.state === "CANCELLED";
+  // A follow-up revision can start a run whenever no run is active; revising a
+  // terminal task reopens it to READY in the domain.
+  const canRerunAfterRevise = task.state !== "RUNNING" && task.state !== "CANCEL_REQUESTED" && task.state !== "DRAFT";
   const mutations = [prepare, start, approve, cancel, retry, revise];
   const anyError = mutations.find((mutation) => mutation.error !== null)?.error ?? null;
   const anyConflict = mutations.some((mutation) => mutation.conflict);
@@ -68,13 +80,10 @@ export function RunControls({ details, run, onChanged }: { details: TaskDetails;
     setReviseOpen(false);
     setReviseText("");
     if (!reviseAndRun || !canRerunAfterRevise) return;
-    if (task.state === "READY") {
-      await start.run({ preset: latestRun?.run.preset ?? "cross-review", providers: latestRun !== null ? assignmentFromSteps(latestRun.steps) : {} });
-    } else if (latestRun !== null) {
-      // Terminal task: retry reopens it and starts on the new current revision.
-      // The backend enforces "latest run only"; a stale viewed run 409s.
-      await retry.run({});
-    }
+    // Revising reopened the task (or it was READY already): start a fresh run
+    // on the new current revision with the previous run's shape.
+    const status = await start.run({ preset: latestRun?.run.preset ?? "cross-review", providers: latestRun !== null ? assignmentFromSteps(latestRun.steps) : {} });
+    followRun(status);
   };
 
   return (
@@ -97,11 +106,11 @@ export function RunControls({ details, run, onChanged }: { details: TaskDetails;
         )}
         {canRetry && (
           <>
-            <button className="primary" disabled={anyPending} onClick={() => void retry.run({})}>Retry</button>
+            <button className="primary" disabled={anyPending} onClick={() => void retry.run({}).then(followRun)}>Retry</button>
             <button
               disabled={anyPending}
               title={hasForeignProviders ? "swap affects claude/codex assignments only; other providers stay as-is" : "rerun with implementer/reviewer swapped"}
-              onClick={() => void retry.run({ providers: swapAssignment(currentAssignment) })}
+              onClick={() => void retry.run({ providers: swapAssignment(currentAssignment) }).then(followRun)}
             >
               Swap &amp; rerun{hasForeignProviders ? " (claude/codex only)" : ""}
             </button>
@@ -121,7 +130,7 @@ export function RunControls({ details, run, onChanged }: { details: TaskDetails;
             disabled={anyPending}
             onClick={() => {
               setStartOpen(false);
-              void start.run({ preset: startPreset, providers: latestRun !== null ? assignmentFromSteps(latestRun.steps) : {} });
+              void start.run({ preset: startPreset, providers: latestRun !== null ? assignmentFromSteps(latestRun.steps) : {} }).then(followRun);
             }}
           >
             Start

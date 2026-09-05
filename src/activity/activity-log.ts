@@ -1,4 +1,5 @@
 import type { Database } from "../db/database.js";
+import { deferOrFirePoke } from "../db/database.js";
 
 export const ACTIVITY_EVENTS = {
   taskCreated: "task.created",
@@ -56,7 +57,9 @@ export class ActivityLog {
   record(event: { type: string; taskId: string; runId?: string; stepRunId?: string; actor?: string; payload?: unknown }): void {
     this.db.prepare("INSERT INTO activity_events (type, task_id, workflow_run_id, step_run_id, actor, payload, created_at) VALUES (?,?,?,?,?,?,?)")
       .run(event.type, event.taskId, event.runId ?? null, event.stepRunId ?? null, event.actor ?? null, JSON.stringify(event.payload ?? {}), this.now());
-    for (const listener of this.listeners) listener();
+    // Deferred inside a write transaction: an uncommitted row must never be
+    // observable by an in-process SSE poll (see withImmediateTransaction).
+    deferOrFirePoke(this.db, () => { for (const listener of this.listeners) listener(); });
   }
 
   /** Latency hint for in-process consumers (SSE). Returns an unsubscribe. */

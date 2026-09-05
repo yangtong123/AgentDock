@@ -46,15 +46,44 @@ export function openDatabase(path: string, options: { migrate?: boolean } = {}):
  * (another BEGIN IMMEDIATE from a queued continuation) throws "cannot start
  * a transaction within a transaction". This is why WorkflowEngine.start /
  * approve / GitHubService.startFixWorkflow have synchronous signatures.
+ *
+ * Latency pokes recorded inside the transaction (ActivityLog) are deferred
+ * until after COMMIT and dropped on ROLLBACK: firing them mid-transaction
+ * would let an in-process consumer read uncommitted rows (same connection),
+ * send them, and advance its durable cursor past ids the rollback returns
+ * to the id pool — the later committed event would reuse an id and be
+ * skipped on reconnect.
  */
+type Poke = () => void;
+const transactionDepths = new WeakMap<Database, number>();
+const pendingPokes = new WeakMap<Database, Poke[]>();
+
+/** Fires immediately outside a write transaction; queues it while one is open. */
+export function deferOrFirePoke(db: Database, poke: Poke): void {
+  if ((transactionDepths.get(db) ?? 0) > 0) {
+    let queue = pendingPokes.get(db);
+    if (queue === undefined) { queue = []; pendingPokes.set(db, queue); }
+    queue.push(poke);
+    return;
+  }
+  poke();
+}
+
 export function withImmediateTransaction<T>(db: Database, fn: () => T): T {
   db.exec("BEGIN IMMEDIATE");
+  transactionDepths.set(db, (transactionDepths.get(db) ?? 0) + 1);
+  let result: T;
   try {
-    const result = fn();
-    db.exec("COMMIT");
-    return result;
+    result = fn();
   } catch (error) {
     db.exec("ROLLBACK");
+    transactionDepths.set(db, (transactionDepths.get(db) ?? 1) - 1);
+    pendingPokes.get(db)?.splice(0); // rolled back: the pokes never happened
     throw error;
   }
+  db.exec("COMMIT");
+  transactionDepths.set(db, (transactionDepths.get(db) ?? 1) - 1);
+  const queued = pendingPokes.get(db)?.splice(0) ?? [];
+  for (const poke of queued) poke();
+  return result;
 }

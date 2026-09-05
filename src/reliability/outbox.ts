@@ -29,6 +29,17 @@ export class CommandDedup {
     return { claimed: true, response: row.response ?? null };
   }
 
+  /**
+   * Deletes a claimed-but-never-answered row older than the cutoff: the
+   * process died between claim and response (crash), so the key is stuck.
+   * Re-execution is safe — domain commands are atomic and state-guarded;
+   * a crash after commit but before the response was stored converges on a
+   * state conflict instead of a duplicate effect. Returns true when reclaimed.
+   */
+  reclaimIfStale(commandKey: string, claimedBeforeIso: string): boolean {
+    return this.db.prepare("DELETE FROM command_dedup WHERE command_key = ? AND response IS NULL AND created_at <= ?").run(commandKey, claimedBeforeIso).changes === 1;
+  }
+
   /** Evicts entries older than the retention window. */
   pruneOlderThan(cutoffIso: string): number {
     return Number(this.db.prepare("DELETE FROM command_dedup WHERE created_at < ?").run(cutoffIso).changes);

@@ -196,7 +196,7 @@ export function RunDetailView({ taskId, tick, onBack }: { taskId: string; tick: 
         )}
         {run?.awaitingApproval === true && <span className="badge attention">awaiting approval</span>}
       </div>
-      <RunControls details={details} run={run} onChanged={refresh} />
+      <RunControls details={details} run={run} onChanged={refresh} onRunCreated={(createdRunId) => { setRunId(createdRunId); setSelectedStep(null); }} />
       <p className="request">{details.currentRevision.request}</p>
       {run === null
         ? <p className="dim">No runs yet.</p>

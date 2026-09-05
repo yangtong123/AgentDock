@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -292,4 +292,37 @@ test("CodexAgent parses session ids from both plain and JSON output", async () =
   const json = spyRunner({ stdout: `{"session_id":"abcdefab-cdef-abcd-efab-cdefabcdefab","type":"message"}\n` });
   const jsonOutcome = await new CodexAgent(json.runner).run({ taskId: "t", role: "IMPLEMENT", worktreePath: "/wt", profile: PROFILES["default"]!, prompt: "p", resumeSessionId: null, revisionRequest: "r", timeoutMs: 1000, env: {} });
   assert.equal(jsonOutcome.externalSessionId, "abcdefab-cdef-abcd-efab-cdefabcdefab");
+});
+
+test("log artifacts are isolated per step: round 2 on the same RESUME thread never overwrites round 1", async () => {
+  const base = mkdtempSync(join(tmpdir(), "agentdock-iso-"));
+  const f = createRepository(join(base, "repo"));
+  const db = openDatabase(":memory:");
+  const artifactsDir = join(base, "artifacts");
+  try {
+    const app = createApplication(db);
+    const project = app.projects.create({ name: "p", repoPath: f, worktreeRoot: join(base, "wt") });
+    const { task } = app.tasks.create(project.id, "multi-round fix");
+    await app.worktrees.prepare(task.id);
+    const threads = new SqliteAgentThreadRepository(db); const artifactRepo = new SqliteArtifactRepository(db); const taskRepo = new SqliteTaskRepository(db);
+    let call = 0;
+    const agent = scriptAgent("fake", () => { call += 1; return { code: 0, stdout: `ROUND-${call} OUTPUT`, stderr: "", sessionId: `sess-${call}` }; });
+    const manager = new AgentThreadManager(threads, artifactRepo, taskRepo, () => agent, artifactsDir);
+    // Real run steps (artifact rows carry FK'd run/step ids); FIX and REVIEW
+    // stand in for the two rounds the same RESUME thread serves.
+    const started = app.workflows.start({ taskId: task.id, preset: "cross-review" });
+    const steps = app.repositories.workflows.listSteps(started.run.id);
+    const stepRound1 = steps.find((s) => s.stepType === "FIX")!.id;
+    const stepRound2 = steps.find((s) => s.stepType === "REVIEW")!.id;
+    const first = await manager.run({ taskId: task.id, role: "FIX", prompt: "fix round 1", revisionRequest: "r", timeoutMs: 5000 }, "fake", { workflowRunId: started.run.id, stepRunId: stepRound1 });
+    const second = await manager.run({ taskId: task.id, role: "FIX", prompt: "fix round 2", revisionRequest: "r", timeoutMs: 5000 }, "fake", { workflowRunId: started.run.id, stepRunId: stepRound2, resumeThreadId: first.thread.id });
+    assert.equal(second.thread.id, first.thread.id, "RESUME policy reuses the thread");
+    const outs = artifactRepo.listForTask(task.id).filter((a) => a.kind === "agent-stdout");
+    assert.equal(outs.length, 2);
+    const pathOf = (a: (typeof outs)[number]) => (a.storage as { type: "FILE"; path: string }).path;
+    assert.notEqual(pathOf(outs[0]!), pathOf(outs[1]!), "each step gets its own file");
+    assert.equal(readFileSync(pathOf(outs.find((a) => a.stepRunId === stepRound1)!), "utf8"), "ROUND-1 OUTPUT", "round 1's log keeps its own output");
+    assert.equal(readFileSync(pathOf(outs.find((a) => a.stepRunId === stepRound2)!), "utf8"), "ROUND-2 OUTPUT");
+    assert.ok(outs.every((a) => a.name.startsWith("fake-FIX-agent-stdout")), "names stay readable and step-suffixed");
+  } finally { db.close(); rmSync(base, { recursive: true, force: true }); }
 });

@@ -278,7 +278,10 @@ export function createGateway(deps: GatewayDeps): Gateway {
       const idempotencyKey = requireIdempotencyKey(req);
       const body = await readJsonBody(req);
       const expectedRunState = body.expectedRunState === undefined ? undefined : asEnum(body.expectedRunState, "expectedRunState", RUN_STATES);
-      const result = await approveRun(commands, { runId: segments[2]!, approved: segments[3] === "approve", ...(expectedRunState !== undefined ? { expectedRunState } : {}), actor: "desktop", idempotencyKey });
+      // Binds the decision to the exact gate the UI saw — runs park at RUNNING
+      // at every gate, so the state alone cannot detect a stale gate request.
+      const expectedApprovalStepId = asOptionalString(body.expectedApprovalStepId, "expectedApprovalStepId", 64);
+      const result = await approveRun(commands, { runId: segments[2]!, approved: segments[3] === "approve", ...(expectedRunState !== undefined ? { expectedRunState } : {}), ...(expectedApprovalStepId !== undefined ? { expectedApprovalStepId } : {}), actor: "desktop", idempotencyKey });
       return sendCommandResult(res, result);
     }
     if (method === "POST" && segments.length === 4 && segments[1] === "runs" && segments[3] === "cancel") {

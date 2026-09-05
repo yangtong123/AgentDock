@@ -299,3 +299,27 @@ test("cancelling a parked run publishes run.cancelled and drops the queue entry"
     assert.equal(f.commands.queue.size(), 0, "a cancelled queued run is never picked up");
   } finally { await f.cleanup(); }
 });
+
+test("approval sweep is per gate: gate 1's delivered notification must not silence gate 2's missing one", async () => {
+  const f = fixture({ withOrchestrator: true });
+  try {
+    const projectId = project(f);
+    const { task } = f.app.tasks.create(projectId, "two-gate crash recovery");
+    await f.app.worktrees.prepare(task.id);
+    const started = f.app.workflows.start({ taskId: task.id, preset: "careful" });
+    await f.app.workflows.execute(started.run.id); // park at gate 1
+    const gate1 = f.app.workflows.pendingApprovalGate(started.run.id)!;
+    // runTask DID publish for gate 1 (delivered, not lost).
+    new TransactionalOutbox(f.db).publish({ taskId: task.id, workflowRunId: started.run.id, type: "approval.requested", payload: { taskId: task.id, runId: started.run.id, gateStepId: gate1.id } });
+    await approveRun(f.commands, { runId: started.run.id, approved: true, actor: "telegram" });
+    const parked2 = await f.app.workflows.execute(started.run.id); // park at gate 2
+    assert.equal(parked2.awaitingApproval, true);
+    const gate2 = f.app.workflows.pendingApprovalGate(started.run.id)!;
+    const countForGate = (gateId: string) => (f.db.prepare("SELECT COUNT(*) c FROM outbox_events WHERE type = 'approval.requested' AND workflow_run_id = ? AND json_extract(payload, '$.gateStepId') = ?").get(started.run.id, gateId) as { c: number }).c;
+    assert.equal(countForGate(gate1.id), 1);
+    assert.equal(countForGate(gate2.id), 0, "crash before gate 2's publish: nothing delivered");
+    assert.ok(f.orchestrator!.notifyParkedApprovalGates() >= 1, "sweep republishes gate 2 despite gate 1's existing notification");
+    assert.equal(countForGate(gate2.id), 1, "gate 2 notification exists exactly once");
+    assert.equal(f.orchestrator!.notifyParkedApprovalGates() === 0 || countForGate(gate2.id) === 1, true, "second sweep does not duplicate gate 2");
+  } finally { await f.cleanup(); }
+});

@@ -216,3 +216,63 @@ test("expectedRunState guard: mismatch conflicts before acting, match proceeds",
     await assert.rejects(retryRun(f.ctx, { runId: started.run.id, expectedRunState: "RUNNING", actor: "test" }), /only finished runs/);
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });
+
+test("approval binds to the pending gate: a stale gate-1 request cannot decide gate 2", async () => {
+  const f = fixture({ fakeAgents: true });
+  try {
+    const { task } = f.app.tasks.create(project(f), "two gates");
+    const started = await startRun(f.ctx, { taskId: task.id, preset: "careful", actor: "test" }) as WorkflowStatus;
+    await parkAtGate(f, started.run.id);
+    const gate1 = f.app.workflows.pendingApprovalGate(started.run.id)!;
+    // Fresh request bound to gate 1 proceeds.
+    await approveRun(f.ctx, { runId: started.run.id, approved: true, expectedApprovalStepId: gate1.id, actor: "test" });
+    // Drive to the second gate (fake reviews PASS).
+    const parked2 = await f.app.workflows.execute(started.run.id);
+    assert.equal(parked2.awaitingApproval, true);
+    const gate2 = f.app.workflows.pendingApprovalGate(started.run.id)!;
+    assert.notEqual(gate2.id, gate1.id);
+    // expectedRunState alone cannot detect the stale view (still RUNNING).
+    const stale = await approveRun(f.ctx, { runId: started.run.id, approved: true, expectedRunState: "RUNNING", expectedApprovalStepId: gate1.id, actor: "stale-ui" }).catch((error: Error) => error);
+    assert.ok(stale instanceof StateConflictError, `stale gate request must conflict, got ${String(stale)}`);
+    assert.equal(f.app.workflows.pendingApprovalGate(started.run.id)?.id, gate2.id, "gate 2 still pending after the stale request");
+    // The correct binding decides it.
+    const done = await approveRun(f.ctx, { runId: started.run.id, approved: true, expectedApprovalStepId: gate2.id, actor: "test" }) as WorkflowStatus;
+    await f.app.workflows.execute(started.run.id);
+    assert.ok(["SUCCEEDED", "RUNNING"].includes(done.run.state));
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("a crashed idempotency claim (answerless past the stale window) is reclaimed, a fresh one still conflicts", async () => {
+  const f = fixture();
+  try {
+    const { task } = f.app.tasks.create(project(f), "dedup crash");
+    // Crash artifact: claimed long ago, response never stored.
+    const first = await createTask(f.ctx, { projectId: task.projectId, request: "a", actor: "test", idempotencyKey: "crashed-1" });
+    assert.ok(!isReplayed(first));
+    f.db.prepare("UPDATE command_dedup SET response = NULL, created_at = ? WHERE command_key = ?").run(new Date(Date.now() - 60 * 60_000).toISOString(), "http:crashed-1");
+    const reclaimed = await createTask(f.ctx, { projectId: task.projectId, request: "b", actor: "test", idempotencyKey: "crashed-1" });
+    assert.ok(!isReplayed(reclaimed), "stale claim is reclaimed and the request executes");
+    // A genuinely in-flight claim (recent, answerless) still conflicts.
+    f.db.prepare("INSERT INTO command_dedup (command_key, created_at) VALUES (?, ?)").run("http:in-flight-1", new Date().toISOString());
+    await assert.rejects(createTask(f.ctx, { projectId: task.projectId, request: "c", actor: "test", idempotencyKey: "in-flight-1" }), /request in progress/);
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("revising a SUCCEEDED task reopens it: the follow-up revision can start a new run", async () => {
+  const f = fixture({ fakeAgents: true });
+  try {
+    const { task } = f.app.tasks.create(project(f), "done then extended");
+    const started = await startRun(f.ctx, { taskId: task.id, preset: "fast", actor: "test" }) as WorkflowStatus;
+    const finished = await f.app.workflows.execute(started.run.id);
+    assert.equal(finished.run.state, "SUCCEEDED");
+    assert.equal(f.app.repositories.tasks.findById(task.id)!.state, "SUCCEEDED");
+    const { reviseTask } = await import("../src/commands/task-commands.js");
+    const revision = await reviseTask(f.ctx, { taskId: task.id, request: "extend it", actor: "test" }) as { revision: number };
+    assert.equal(revision.revision, 2);
+    assert.equal(f.app.repositories.tasks.findById(task.id)!.state, "READY", "terminal task reopens for the new revision");
+    const second = await startRun(f.ctx, { taskId: task.id, preset: "fast", actor: "test" }) as WorkflowStatus;
+    assert.equal(runCount(f.db, task.id), 2);
+    assert.notEqual(second.run.id, started.run.id);
+    assert.equal(f.app.repositories.tasks.findById(task.id)!.state, "RUNNING");
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});

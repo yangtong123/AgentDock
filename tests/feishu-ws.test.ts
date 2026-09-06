@@ -59,3 +59,22 @@ test("FeishuWsAdapter send() degrades actions to text commands (card frames are 
   await adapter.send({ conversationId: "oc-1", text: "done" });
   assert.equal(created[1]!.data.msg_type, "text");
 });
+
+test("FeishuWsAdapter degraded approval hints carry the gate suffix (stale hints cannot decide the next gate)", async () => {
+  const created: { params: unknown; data: Record<string, string> }[] = [];
+  const adapter = new FeishuWsAdapter("app-id", "app-secret", {
+    apiClient: () => ({ im: { v1: { message: { create: async (input) => { created.push(input); return {}; } } } } }),
+  });
+  const runId = "12345678-1234-1234-1234-123456789012";
+  await adapter.send({
+    conversationId: "oc-1",
+    text: "paused for approval",
+    actions: [
+      { label: "Approve", command: { type: "APPROVE_RUN", conversationId: "oc-1", runId, approved: true, gatePrefix: "ab12cd34" } },
+      { label: "Reject", command: { type: "APPROVE_RUN", conversationId: "oc-1", runId, approved: false, gatePrefix: "ab12cd34" } },
+    ],
+  });
+  const text = JSON.parse(created[0]!.data.content!) as { text: string };
+  assert.match(text.text, new RegExp(`/approve ${runId} ab12cd34`), "approve hint binds to the gate");
+  assert.match(text.text, new RegExp(`/reject ${runId} ab12cd34`), "reject hint binds to the gate");
+});

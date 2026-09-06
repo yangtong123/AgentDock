@@ -78,10 +78,13 @@ export class FeishuWsAdapter implements ImAdapter {
     // fires over the long connection (same root cause as
     // larksuite/oapi-sdk-python#126) and interactive buttons would be dead.
     // Degrade actions to explicit text commands instead; the webhook
-    // transport renders real cards.
+    // transport renders real cards. Gate suffixes keep degraded hints bound to
+    // the exact gate the action was rendered for.
     const hints = (reply.actions ?? []).flatMap((action) =>
       action.command.type === "APPROVE_RUN"
-        ? [action.command.approved ? `/approve ${action.command.runId}` : `/reject ${action.command.runId}`]
+        ? [action.command.approved
+          ? `/approve ${action.command.runId}${action.command.gatePrefix !== undefined ? ` ${action.command.gatePrefix}` : ""}`
+          : `/reject ${action.command.runId}${action.command.gatePrefix !== undefined ? ` ${action.command.gatePrefix}` : ""}`]
         : []);
     // Any action at all degrades to text: a card with unknown button types
     // would be just as dead over the long connection.

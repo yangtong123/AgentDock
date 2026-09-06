@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { openDatabase, withImmediateTransaction } from "../src/db/database.js";
@@ -144,17 +144,26 @@ test("pokes defer until COMMIT and never fire for rolled-back events", () => {
 });
 
 test("guard: durable writes never hand-roll transactions outside database.ts", () => {
-  const srcRoot = new URL("../src/", import.meta.url);
+  // Tests execute from dist/, so resolve the real source tree by walking up to
+  // the repository root (the directory holding package.json).
+  let root = dirname(fileURLToPath(import.meta.url));
+  while (!existsSync(join(root, "package.json")) && root !== dirname(root)) root = dirname(root);
+  const srcRoot = join(root, "src");
+  assert.ok(existsSync(srcRoot), `source tree not found at ${srcRoot}`);
   const offenders: string[] = [];
+  let scanned = 0;
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, entry.name);
       if (entry.isDirectory()) { walk(full); continue; }
       if (!entry.name.endsWith(".ts")) continue;
+      scanned += 1;
       if (full.endsWith("db/database.ts")) continue; // the one allowed home of BEGIN/COMMIT
       if (readFileSync(full, "utf8").includes('exec("BEGIN')) offenders.push(full);
     }
   };
-  walk(fileURLToPath(srcRoot));
+  walk(srcRoot);
+  assert.ok(scanned > 20, `guard scanned only ${scanned} source files — path resolution is broken`);
+  assert.ok(existsSync(join(srcRoot, "db", "database.ts")), "the exempted file must be the real one");
   assert.deepEqual(offenders, [], "raw BEGINs bypass the poke-deferring transaction helper and can leak uncommitted SSE events");
 });

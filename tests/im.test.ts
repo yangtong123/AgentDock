@@ -9,7 +9,7 @@ import { createRepository } from "./helpers.js";
 import { parseCommand, IM_RUN_PRESETS } from "../src/im/command-parser.js";
 import { expandPreset } from "../src/workflows/presets.js";
 import { ImController } from "../src/im/im-controller.js";
-import { TelegramAdapter, decodeCallback } from "../src/im/telegram-adapter.js";
+import { TelegramAdapter, decodeCallback, encodeCallback } from "../src/im/telegram-adapter.js";
 import type { ImAdapter, ImMessage, ImReply } from "../src/im/im-adapter.js";
 
 test("parser maps /commands to domain commands and ignores chat", () => {
@@ -322,4 +322,18 @@ test("controller: /watch subscribes an IM conversation to a task without prior I
 
     assert.equal(telegram.delivered.some((msg) => msg.conversationId === "chat-42" && msg.text.includes("finished: SUCCEEDED")), true);
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("callback codec round-trips the gate suffix so a stale card cannot decide the next gate", () => {
+  const runId = "11111111-2222-3333-4444-555555555555";
+  const gate1 = "aaaaaaaabbbb"; // first 8 chars of gate 1's step id
+  const gate2 = "ccccccccdddd";
+  const encoded = encodeCallback({ type: "APPROVE_RUN", conversationId: "42", runId, approved: true, gatePrefix: gate1.slice(0, 8) })!;
+  assert.ok(encoded.length <= 64, `telegram callback_data budget: ${encoded.length}`);
+  const decoded = decodeCallback(encoded, "42") as { type: "APPROVE_RUN"; gatePrefix?: string };
+  assert.deepEqual(decoded, { type: "APPROVE_RUN", conversationId: "42", runId, approved: true, gatePrefix: "aaaaaaaa" });
+  // Malformed gate suffixes are rejected outright, not silently dropped.
+  assert.equal(decodeCallback(`ar:${runId}:1:zzzzzzzz`, "42"), null);
+  assert.equal((decodeCallback(`ar:${runId}:1`, "42") as { gatePrefix?: string }).gatePrefix, undefined, "legacy payloads without a gate still decode");
+  void gate2;
 });

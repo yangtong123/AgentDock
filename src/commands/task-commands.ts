@@ -73,7 +73,13 @@ async function idempotent<T>(ctx: CommandContext, key: string | undefined, fn: (
     if (response === "post-hoc") dedup.storeResponse(commandKey, JSON.stringify(value ?? null));
     return value;
   } catch (error) {
-    ctx.db.prepare("DELETE FROM command_dedup WHERE command_key = ?").run(commandKey);
+    // The effect may have COMMITTED and only post-commit work failed (a poke
+    // listener, an out-of-transaction callback): deleting the row would let a
+    // retry re-execute and duplicate the effect. Keep the committed response —
+    // the retry replays it instead. Pre-commit failures have no response and
+    // stay retryable.
+    const committed = new CommandDedup(ctx.db).lookup(commandKey).response !== null;
+    if (!committed) ctx.db.prepare("DELETE FROM command_dedup WHERE command_key = ?").run(commandKey);
     throw error;
   }
 }
@@ -179,10 +185,10 @@ export async function startRun(ctx: CommandContext, input: {
       });
       // Payload shape is the contract across surfaces: { preset, providers? }.
       ctx.activity.record({ type: ACTIVITY_EVENTS.runQueued, taskId: input.taskId, runId: s.run.id, actor: input.actor, payload: { preset: input.preset, ...(input.providers !== undefined && Object.keys(input.providers).length > 0 ? { providers: input.providers } : {}) } });
+      ctx.audit.record({ actor: input.actor, action: "run.start", taskId: input.taskId, detail: { runId: s.run.id, preset: input.preset } });
       storeTransactionalResponse(ctx, input.idempotencyKey, s);
       return s;
     });
-    ctx.audit.record({ actor: input.actor, action: "run.start", taskId: input.taskId, detail: { runId: started.run.id, preset: input.preset } });
     return started;
   }, "transactional");
 }
@@ -211,10 +217,10 @@ export async function approveRun(ctx: CommandContext, input: { runId: string; ap
       // the same transaction); an executing run's cancel is reported by the
       // orchestrator's runTask unwind instead — exactly one publisher per path.
       if (!input.approved && taskId !== null) ctx.outbox.publish({ taskId, workflowRunId: input.runId, type: "run.cancelled", payload: { taskId, runId: input.runId } });
+      ctx.audit.record({ actor: input.actor, action: input.approved ? "run.approve" : "run.reject", ...(taskId !== null ? { taskId } : {}), detail: { runId: input.runId } });
       storeTransactionalResponse(ctx, input.idempotencyKey, s);
       return s;
     });
-    ctx.audit.record({ actor: input.actor, action: input.approved ? "run.approve" : "run.reject", ...(taskId !== null ? { taskId } : {}), detail: { runId: input.runId } });
     return Promise.resolve(status);
   }, "transactional");
 }
@@ -241,10 +247,10 @@ export async function cancelRun(ctx: CommandContext, input: { runId: string; exp
         const leased = ctx.db.prepare("SELECT 1 AS x FROM worker_leases WHERE task_id = ? AND expires_at > ?").get(taskId, new Date().toISOString()) !== undefined;
         if (!leased) ctx.outbox.publish({ taskId, workflowRunId: input.runId, type: "run.cancelled", payload: { taskId, runId: input.runId } });
       }
+      ctx.audit.record({ actor: input.actor, action: "run.cancel", ...(taskId !== null ? { taskId } : {}), detail: { runId: input.runId } });
       storeTransactionalResponse(ctx, input.idempotencyKey, cancelled);
       return cancelled;
     });
-    ctx.audit.record({ actor: input.actor, action: "run.cancel", ...(taskId !== null ? { taskId } : {}), detail: { runId: input.runId } });
     return Promise.resolve(status);
   }, "transactional");
 }
@@ -289,10 +295,10 @@ export async function retryRun(ctx: CommandContext, input: { runId: string; prov
       const s = ctx.app.workflows.start({ taskId, preset, providers, maxReviewRounds: run.maxReviewRounds, stepTimeoutMs: run.stepTimeoutMs });
       ctx.queue.enqueue(taskId);
       ctx.activity.record({ type: ACTIVITY_EVENTS.runQueued, taskId, runId: s.run.id, actor: input.actor, payload: { preset, retryOf: run.id } });
+      ctx.audit.record({ actor: input.actor, action: "run.retry", taskId, detail: { runId: s.run.id, retryOf: run.id } });
       storeTransactionalResponse(ctx, input.idempotencyKey, s);
       return s;
     });
-    ctx.audit.record({ actor: input.actor, action: "run.retry", taskId, detail: { runId: started.run.id, retryOf: run.id } });
     return Promise.resolve(started);
   }, "transactional");
 }

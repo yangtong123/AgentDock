@@ -9,7 +9,11 @@ const MAX_CALLBACK_DATA_BYTES = 64;
 /** Compact callback payloads: Telegram caps callback_data at 64 bytes, so JSON commands don't fit. */
 export function encodeCallback(command: ImCommand): string | null {
   switch (command.type) {
-    case "APPROVE_RUN": return `ar:${command.runId}:${command.approved ? "1" : "0"}`;
+    // The optional gate suffix keeps the decision bound to the exact gate the
+    // button was rendered for: a stale card must not decide the next gate.
+    case "APPROVE_RUN": return command.gatePrefix !== undefined
+      ? `ar:${command.runId}:${command.approved ? "1" : "0"}:${command.gatePrefix}`
+      : `ar:${command.runId}:${command.approved ? "1" : "0"}`;
     case "STOP_TASK": return command.taskId.length + 8 <= MAX_CALLBACK_DATA_BYTES ? `st:${command.taskId}` : null;
     case "CONTINUE_RUN": return `cr:${command.runId}`;
     default: return null;
@@ -18,11 +22,13 @@ export function encodeCallback(command: ImCommand): string | null {
 
 /** Reverses encodeCallback; only whitelisted shapes are accepted. Returns null for anything else. */
 export function decodeCallback(data: string, conversationId: string): ImCommand | null {
-  const [prefix, a, b] = data.split(":");
+  const [prefix, a, b, gatePrefix] = data.split(":");
   const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const gatePattern = /^[0-9a-f]{8}$/i;
   if (prefix === "ar" && a && b !== undefined) {
     if (!uuidPattern.test(a) || (b !== "0" && b !== "1")) return null;
-    return { type: "APPROVE_RUN", conversationId, runId: a, approved: b === "1" };
+    if (gatePrefix !== undefined && !gatePattern.test(gatePrefix)) return null;
+    return { type: "APPROVE_RUN", conversationId, runId: a, approved: b === "1", ...(gatePrefix !== undefined ? { gatePrefix } : {}) };
   }
   if (prefix === "st" && a) {
     if (!uuidPattern.test(a)) return null;

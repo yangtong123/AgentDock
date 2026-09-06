@@ -88,6 +88,10 @@ export function withImmediateTransaction<T>(db: Database, fn: () => T): T {
   db.exec("COMMIT");
   transactionDepths.set(db, (transactionDepths.get(db) ?? 1) - 1);
   const queued = pendingPokes.get(db)?.splice(0) ?? [];
-  for (const poke of queued) poke();
+  for (const poke of queued) {
+    // POST-commit isolation: a broken latency-hint consumer (e.g. an SSE
+    // reader) must not fail the domain operation after its effect is durable.
+    try { poke(); } catch { /* listener error; polling is the source of truth */ }
+  }
   return result;
 }

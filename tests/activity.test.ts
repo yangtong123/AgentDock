@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { openDatabase, withImmediateTransaction } from "../src/db/database.js";
 import { createApplication } from "../src/app/application.js";
@@ -140,4 +141,20 @@ test("pokes defer until COMMIT and never fire for rolled-back events", () => {
     assert.equal(pokes, 2);
     assert.equal(log.listSince(0, 100).filter((e) => e.type === "task.revised").length, 1);
   } finally { db.close(); }
+});
+
+test("guard: durable writes never hand-roll transactions outside database.ts", () => {
+  const srcRoot = new URL("../src/", import.meta.url);
+  const offenders: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!entry.name.endsWith(".ts")) continue;
+      if (full.endsWith("db/database.ts")) continue; // the one allowed home of BEGIN/COMMIT
+      if (readFileSync(full, "utf8").includes('exec("BEGIN')) offenders.push(full);
+    }
+  };
+  walk(fileURLToPath(srcRoot));
+  assert.deepEqual(offenders, [], "raw BEGINs bypass the poke-deferring transaction helper and can leak uncommitted SSE events");
 });

@@ -242,19 +242,61 @@ test("approval binds to the pending gate: a stale gate-1 request cannot decide g
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });
 
-test("a crashed idempotency claim (answerless past the stale window) is reclaimed, a fresh one still conflicts", async () => {
+test("idempotency crash windows: pre-commit claims reclaim without duplicates; committed effects replay", async () => {
   const f = fixture();
   try {
-    const { task } = f.app.tasks.create(project(f), "dedup crash");
-    // Crash artifact: claimed long ago, response never stored.
-    const first = await createTask(f.ctx, { projectId: task.projectId, request: "a", actor: "test", idempotencyKey: "crashed-1" });
-    assert.ok(!isReplayed(first));
-    f.db.prepare("UPDATE command_dedup SET response = NULL, created_at = ? WHERE command_key = ?").run(new Date(Date.now() - 60 * 60_000).toISOString(), "http:crashed-1");
-    const reclaimed = await createTask(f.ctx, { projectId: task.projectId, request: "b", actor: "test", idempotencyKey: "crashed-1" });
-    assert.ok(!isReplayed(reclaimed), "stale claim is reclaimed and the request executes");
+    const projectId = project(f);
+    const taskCount = (request: string) => Number((f.db.prepare("SELECT COUNT(*) c FROM tasks t JOIN task_revisions r ON r.task_id = t.id WHERE t.project_id = ? AND r.request = ?").get(projectId, request) as { c: number }).c);
+    const hourAgo = new Date(Date.now() - 60 * 60_000).toISOString();
+
+    // Window 1 — crash BEFORE the domain commit: a stale answerless claim and
+    // no committed effect. Reclaim re-executes and creates exactly one task.
+    f.db.prepare("INSERT INTO command_dedup (command_key, created_at) VALUES (?, ?)").run("http:crash-pre", hourAgo);
+    const reclaimed = await createTask(f.ctx, { projectId, request: "pre", actor: "test", idempotencyKey: "crash-pre" });
+    assert.ok(!isReplayed(reclaimed));
+    assert.equal(taskCount("pre"), 1, "no duplicate task from the reclaimed claim");
+
+    // Window 2 — crash AFTER the domain commit: with transactional responses
+    // the response is committed with the effect, so a retry replays it.
+    const committed = await createTask(f.ctx, { projectId, request: "post", actor: "test", idempotencyKey: "crash-post" });
+    assert.ok(!isReplayed(committed));
+    const replayed = await createTask(f.ctx, { projectId, request: "post", actor: "test", idempotencyKey: "crash-post" });
+    assert.ok(isReplayed(replayed), "committed effect replays its stored response");
+    assert.equal(taskCount("post"), 1, "replay creates no second task");
+
+    // Revisions are creation-shaped too: a reclaimed claim appends exactly one.
+    const { task } = f.app.tasks.create(projectId, "revise me");
+    f.db.prepare("INSERT INTO command_dedup (command_key, created_at) VALUES (?, ?)").run("http:crash-rev", hourAgo);
+    const { reviseTask } = await import("../src/commands/task-commands.js");
+    const revision = await reviseTask(f.ctx, { taskId: task.id, request: "again", actor: "test", idempotencyKey: "crash-rev" }) as { revision: number };
+    assert.equal(revision.revision, 2);
+    assert.equal(f.app.tasks.show(task.id).revisions.length, 2, "no duplicate revision from the reclaimed claim");
+
     // A genuinely in-flight claim (recent, answerless) still conflicts.
     f.db.prepare("INSERT INTO command_dedup (command_key, created_at) VALUES (?, ?)").run("http:in-flight-1", new Date().toISOString());
-    await assert.rejects(createTask(f.ctx, { projectId: task.projectId, request: "c", actor: "test", idempotencyKey: "in-flight-1" }), /request in progress/);
+    await assert.rejects(createTask(f.ctx, { projectId, request: "inflight", actor: "test", idempotencyKey: "in-flight-1" }), /request in progress/);
+  } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test("revise/retry ordering converges: revising an active task keeps RUNNING; retry after a revise-driven reopen conflicts", async () => {
+  const f = fixture({ fakeAgents: true });
+  try {
+    const projectId = project(f);
+    // A run is active (startRun leaves the task RUNNING until execution finishes).
+    const { task } = f.app.tasks.create(projectId, "active task");
+    const started = await startRun(f.ctx, { taskId: task.id, preset: "fast", actor: "test" }) as WorkflowStatus;
+    assert.equal(f.app.repositories.tasks.findById(task.id)!.state, "RUNNING");
+    const { reviseTask } = await import("../src/commands/task-commands.js");
+    await reviseTask(f.ctx, { taskId: task.id, request: "changed mid-flight", actor: "test" });
+    assert.equal(f.app.repositories.tasks.findById(task.id)!.state, "RUNNING", "revise must never overwrite an active run's state back to READY");
+    await f.app.workflows.execute(started.run.id); // settle to SUCCEEDED
+
+    // Reverse order: revise reopens the terminal task, then a retry of the old
+    // run must NOT open a second run on top of the reopened revision.
+    await reviseTask(f.ctx, { taskId: task.id, request: "follow-up", actor: "test" });
+    assert.equal(f.app.repositories.tasks.findById(task.id)!.state, "READY");
+    await assert.rejects(retryRun(f.ctx, { runId: started.run.id, actor: "test" }), StateConflictError, "retry cannot reopen a task the revision already reopened");
+    assert.equal(runCount(f.db, task.id), 1, "exactly one run exists");
   } finally { f.db.close(); rmSync(f.base, { recursive: true, force: true }); }
 });
 

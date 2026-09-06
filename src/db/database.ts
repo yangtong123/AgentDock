@@ -70,6 +70,10 @@ export function deferOrFirePoke(db: Database, poke: Poke): void {
 }
 
 export function withImmediateTransaction<T>(db: Database, fn: () => T): T {
+  // Re-entrant: an inner call joins the caller's open transaction instead of
+  // nesting BEGINs (which SQLite rejects). Rollback stays owned by the
+  // outermost call — an inner failure propagates and unwinds everything.
+  if ((transactionDepths.get(db) ?? 0) > 0) return fn();
   db.exec("BEGIN IMMEDIATE");
   transactionDepths.set(db, (transactionDepths.get(db) ?? 0) + 1);
   let result: T;

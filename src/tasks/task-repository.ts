@@ -1,4 +1,4 @@
-import type { Database } from "../db/database.js";
+import { withImmediateTransaction, type Database } from "../db/database.js";
 import type { Task, TaskRevision, TaskState } from "../shared/domain.js";
 import { NotFoundError } from "../shared/domain.js";
 
@@ -22,21 +22,17 @@ export interface TaskRepository {
 export class SqliteTaskRepository implements TaskRepository {
   constructor(private readonly db: Database) {}
   createWithRevision(task: Task, revision: TaskRevision): void {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    withImmediateTransaction(this.db, () => {
       this.db.prepare("INSERT INTO tasks (id,project_id,state,current_revision,branch,worktree_path,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)").run(task.id,task.projectId,task.state,task.currentRevision,task.branch,task.worktreePath,task.createdAt,task.updatedAt);
       this.db.prepare("INSERT INTO task_revisions (id,task_id,revision,request,created_at) VALUES (?,?,?,?,?)").run(revision.id,revision.taskId,revision.revision,revision.request,revision.createdAt);
-      this.db.exec("COMMIT");
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    });
   }
   addRevision(taskId: string, revision: TaskRevision, updatedAt: string): void {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    withImmediateTransaction(this.db, () => {
       const result = this.db.prepare("UPDATE tasks SET current_revision = ?, updated_at = ? WHERE id = ? AND current_revision = ?").run(revision.revision, updatedAt, taskId, revision.revision - 1);
       if (result.changes !== 1) throw new Error("Task revision changed concurrently or task does not exist");
       this.db.prepare("INSERT INTO task_revisions (id,task_id,revision,request,created_at) VALUES (?,?,?,?,?)").run(revision.id,revision.taskId,revision.revision,revision.request,revision.createdAt);
-      this.db.exec("COMMIT");
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    });
   }
   update(taskId:string,changes:TaskChanges,updatedAt:string):Task {
     const sets:string[]=[]; const values:(string|number|null)[]=[];

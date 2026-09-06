@@ -146,30 +146,41 @@ export function RunDetailView({ taskId, tick, onBack }: { taskId: string; tick: 
   const refresh = (): void => setLocalTick((value) => value + 1);
 
   useEffect(() => {
+    let stale = false;
     apiGet<TaskDetails>(`/tasks/${taskId}`)
       .then((data) => {
+        if (stale) return; // a newer request superseded this one
         setDetails(data);
         setRunId((current) => current ?? data.runs.at(-1)?.run.id ?? null);
       })
-      .catch((err: Error) => setError(err.message));
+      .catch((err: Error) => { if (!stale) setError(err.message); });
+    return () => { stale = true; };
   }, [taskId, tick, localTick]);
 
   useEffect(() => {
-    apiGet<Artifact[]>(`/tasks/${taskId}/artifacts`).then(setArtifacts).catch(() => undefined);
-    apiGet<ActivityEvent[]>(`/tasks/${taskId}/activity?limit=200`).then(setActivity).catch(() => undefined);
+    let stale = false;
+    apiGet<Artifact[]>(`/tasks/${taskId}/artifacts`).then((data) => { if (!stale) setArtifacts(data); }).catch(() => undefined);
+    apiGet<ActivityEvent[]>(`/tasks/${taskId}/activity?limit=200`).then((data) => { if (!stale) setActivity(data); }).catch(() => undefined);
+    return () => { stale = true; };
   }, [taskId, tick, localTick]);
 
   useEffect(() => {
     if (runId === null) { setRun(null); return; }
+    // Late responses must not overwrite the currently viewed run: after a
+    // retry switches to the new run, a slow fetch for the old one could
+    // still resolve and repaint stale steps/controls under the new selection.
+    let stale = false;
     apiGet<RunStatus>(`/runs/${runId}`)
       .then((data) => {
+        if (stale) return;
         setRun(data);
         setSelectedStep((current) => {
           if (current !== null && data.steps.some((step) => step.id === current)) return current;
           return data.steps.find((step) => step.state === "RUNNING")?.id ?? data.steps.at(-1)?.id ?? null;
         });
       })
-      .catch((err: Error) => setError(err.message));
+      .catch((err: Error) => { if (!stale) setError(err.message); });
+    return () => { stale = true; };
   }, [runId, tick, localTick]);
 
   const selected = useMemo(() => run?.steps.find((step) => step.id === selectedStep) ?? null, [run, selectedStep]);

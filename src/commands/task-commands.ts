@@ -45,13 +45,18 @@ export function isReplayed(result: unknown): result is Replayed {
  * runs and carries the JSON response afterwards. A claimed row without a
  * response means a concurrent request is still in flight. Failures release
  * the key so the request stays retryable (same rule as Orchestrator.once).
- * A claim left answerless past CLAIM_STALE_MS is a crash artifact (the
- * process died between claim and response) and is reclaimed: without this,
- * such a key would answer "request in progress" forever.
+ *
+ * Crash safety: creation-shaped commands (create/revise/start/approve/
+ * retry/cancel) store the response INSIDE their own domain transaction
+ * (`response: "transactional"`), so a committed effect always leaves a
+ * committed response. A claim that is still answerless past CLAIM_STALE_MS
+ * therefore proves its effect never committed — the row is reclaimed and
+ * the request re-executes exactly once. Convergent commands (prepare) may
+ * re-execute safely and store the response post hoc.
  */
 const CLAIM_STALE_MS = 15 * 60_000;
 
-async function idempotent<T>(ctx: CommandContext, key: string | undefined, fn: () => Promise<T>): Promise<T | Replayed> {
+async function idempotent<T>(ctx: CommandContext, key: string | undefined, fn: () => Promise<T>, response: "transactional" | "post-hoc" = "post-hoc"): Promise<T | Replayed> {
   if (key === undefined) return fn();
   const dedup = new CommandDedup(ctx.db);
   const commandKey = `http:${key}`;
@@ -65,12 +70,18 @@ async function idempotent<T>(ctx: CommandContext, key: string | undefined, fn: (
   }
   try {
     const value = await fn();
-    dedup.storeResponse(commandKey, JSON.stringify(value ?? null));
+    if (response === "post-hoc") dedup.storeResponse(commandKey, JSON.stringify(value ?? null));
     return value;
   } catch (error) {
     ctx.db.prepare("DELETE FROM command_dedup WHERE command_key = ?").run(commandKey);
     throw error;
   }
+}
+
+/** Stores the command response inside the caller's open domain transaction. */
+function storeTransactionalResponse(ctx: CommandContext, key: string | undefined, value: unknown): void {
+  if (key === undefined) return;
+  new CommandDedup(ctx.db).storeResponse(`http:${key}`, JSON.stringify(value ?? null));
 }
 
 function taskIdForRun(db: Database, runId: string): string | null {
@@ -102,20 +113,31 @@ function requireRunState(ctx: CommandContext, runId: string, expected: string | 
 
 export async function createTask(ctx: CommandContext, input: { projectId: string; request: string } & CommandCall): Promise<TaskDetails | Replayed> {
   return idempotent(ctx, input.idempotencyKey, () => {
-    const details = ctx.app.tasks.create(input.projectId, input.request);
-    ctx.activity.record({ type: ACTIVITY_EVENTS.taskCreated, taskId: details.task.id, actor: input.actor, payload: { projectId: input.projectId, request: details.currentRevision.request } });
-    ctx.audit.record({ actor: input.actor, action: "task.create", taskId: details.task.id, detail: { projectId: input.projectId } });
+    // One transaction: task + revision + activity + audit + the idempotent
+    // response commit together, so a crash can never leave an effect without
+    // its response (retries would duplicate the task).
+    const details = withImmediateTransaction(ctx.db, () => {
+      const created = ctx.app.tasks.create(input.projectId, input.request);
+      ctx.activity.record({ type: ACTIVITY_EVENTS.taskCreated, taskId: created.task.id, actor: input.actor, payload: { projectId: input.projectId, request: created.currentRevision.request } });
+      ctx.audit.record({ actor: input.actor, action: "task.create", taskId: created.task.id, detail: { projectId: input.projectId } });
+      storeTransactionalResponse(ctx, input.idempotencyKey, created);
+      return created;
+    });
     return Promise.resolve(details);
-  });
+  }, "transactional");
 }
 
 export async function reviseTask(ctx: CommandContext, input: { taskId: string; request: string } & CommandCall): Promise<TaskRevision | Replayed> {
   return idempotent(ctx, input.idempotencyKey, () => {
-    const revision = ctx.app.tasks.revise(input.taskId, input.request);
-    ctx.activity.record({ type: ACTIVITY_EVENTS.taskRevised, taskId: input.taskId, actor: input.actor, payload: { revision: revision.revision, request: revision.request } });
-    ctx.audit.record({ actor: input.actor, action: "task.revise", taskId: input.taskId, detail: { revision: revision.revision } });
+    const revision = withImmediateTransaction(ctx.db, () => {
+      const created = ctx.app.tasks.revise(input.taskId, input.request);
+      ctx.activity.record({ type: ACTIVITY_EVENTS.taskRevised, taskId: input.taskId, actor: input.actor, payload: { revision: created.revision, request: created.request } });
+      ctx.audit.record({ actor: input.actor, action: "task.revise", taskId: input.taskId, detail: { revision: created.revision } });
+      storeTransactionalResponse(ctx, input.idempotencyKey, created);
+      return created;
+    });
     return Promise.resolve(revision);
-  });
+  }, "transactional");
 }
 
 export async function prepareTask(ctx: CommandContext, input: { taskId: string } & CommandCall): Promise<Task | Replayed> {
@@ -157,11 +179,12 @@ export async function startRun(ctx: CommandContext, input: {
       });
       // Payload shape is the contract across surfaces: { preset, providers? }.
       ctx.activity.record({ type: ACTIVITY_EVENTS.runQueued, taskId: input.taskId, runId: s.run.id, actor: input.actor, payload: { preset: input.preset, ...(input.providers !== undefined && Object.keys(input.providers).length > 0 ? { providers: input.providers } : {}) } });
+      storeTransactionalResponse(ctx, input.idempotencyKey, s);
       return s;
     });
     ctx.audit.record({ actor: input.actor, action: "run.start", taskId: input.taskId, detail: { runId: started.run.id, preset: input.preset } });
     return started;
-  });
+  }, "transactional");
 }
 
 export async function approveRun(ctx: CommandContext, input: { runId: string; approved: boolean; expectedRunState?: string; expectedApprovalStepId?: string } & CommandCall): Promise<WorkflowStatus | Replayed> {
@@ -188,35 +211,42 @@ export async function approveRun(ctx: CommandContext, input: { runId: string; ap
       // the same transaction); an executing run's cancel is reported by the
       // orchestrator's runTask unwind instead — exactly one publisher per path.
       if (!input.approved && taskId !== null) ctx.outbox.publish({ taskId, workflowRunId: input.runId, type: "run.cancelled", payload: { taskId, runId: input.runId } });
+      storeTransactionalResponse(ctx, input.idempotencyKey, s);
       return s;
     });
     ctx.audit.record({ actor: input.actor, action: input.approved ? "run.approve" : "run.reject", ...(taskId !== null ? { taskId } : {}), detail: { runId: input.runId } });
     return Promise.resolve(status);
-  });
+  }, "transactional");
 }
 
 export async function cancelRun(ctx: CommandContext, input: { runId: string; expectedRunState?: string } & CommandCall): Promise<WorkflowStatus | Replayed> {
   return idempotent(ctx, input.idempotencyKey, () => {
-    requireRunState(ctx, input.runId, input.expectedRunState);
     const taskId = taskIdForRun(ctx.db, input.runId);
-    const task = taskId !== null ? ctx.app.repositories.tasks.findById(taskId) : undefined;
-    const wasRunning = task?.state === "RUNNING";
-    const status = ctx.app.workflows.cancel(input.runId);
-    // A live task's agent processes must die with the run; requestCancel also
-    // records task.cancel-requested into the activity stream.
-    if (wasRunning && taskId !== null && ctx.orchestrator !== undefined) ctx.orchestrator.requestCancel(taskId, input.actor);
-    if (taskId !== null) {
-      // A queued-but-never-claimed run must not be picked up after cancellation.
-      ctx.queue.dequeue(taskId);
-      // Publisher split (exactly once): a live lease means a worker is
-      // executing and its runTask unwind publishes run.cancelled; otherwise
-      // (queued, parked at a gate) nobody else will, so we publish here.
-      const leased = ctx.db.prepare("SELECT 1 AS x FROM worker_leases WHERE task_id = ? AND expires_at > ?").get(taskId, new Date().toISOString()) !== undefined;
-      if (!leased) ctx.outbox.publish({ taskId, workflowRunId: input.runId, type: "run.cancelled", payload: { taskId, runId: input.runId } });
-    }
+    // Durable writes + response commit as one transaction; requestCancel's
+    // process kill is a synchronous signal and stays in its original order.
+    const status = withImmediateTransaction(ctx.db, () => {
+      requireRunState(ctx, input.runId, input.expectedRunState);
+      const task = taskId !== null ? ctx.app.repositories.tasks.findById(taskId) : undefined;
+      const wasRunning = task?.state === "RUNNING";
+      const cancelled = ctx.app.workflows.cancel(input.runId);
+      // A live task's agent processes must die with the run; requestCancel also
+      // records task.cancel-requested into the activity stream.
+      if (wasRunning && taskId !== null && ctx.orchestrator !== undefined) ctx.orchestrator.requestCancel(taskId, input.actor);
+      if (taskId !== null) {
+        // A queued-but-never-claimed run must not be picked up after cancellation.
+        ctx.queue.dequeue(taskId);
+        // Publisher split (exactly once): a live lease means a worker is
+        // executing and its runTask unwind publishes run.cancelled; otherwise
+        // (queued, parked at a gate) nobody else will, so we publish here.
+        const leased = ctx.db.prepare("SELECT 1 AS x FROM worker_leases WHERE task_id = ? AND expires_at > ?").get(taskId, new Date().toISOString()) !== undefined;
+        if (!leased) ctx.outbox.publish({ taskId, workflowRunId: input.runId, type: "run.cancelled", payload: { taskId, runId: input.runId } });
+      }
+      storeTransactionalResponse(ctx, input.idempotencyKey, cancelled);
+      return cancelled;
+    });
     ctx.audit.record({ actor: input.actor, action: "run.cancel", ...(taskId !== null ? { taskId } : {}), detail: { runId: input.runId } });
     return Promise.resolve(status);
-  });
+  }, "transactional");
 }
 
 /** Retries a failed/cancelled run: task reopens, same preset/bounds and provider assignment (unless overridden), fresh run enqueued. */
@@ -259,9 +289,10 @@ export async function retryRun(ctx: CommandContext, input: { runId: string; prov
       const s = ctx.app.workflows.start({ taskId, preset, providers, maxReviewRounds: run.maxReviewRounds, stepTimeoutMs: run.stepTimeoutMs });
       ctx.queue.enqueue(taskId);
       ctx.activity.record({ type: ACTIVITY_EVENTS.runQueued, taskId, runId: s.run.id, actor: input.actor, payload: { preset, retryOf: run.id } });
+      storeTransactionalResponse(ctx, input.idempotencyKey, s);
       return s;
     });
     ctx.audit.record({ actor: input.actor, action: "run.retry", taskId, detail: { runId: started.run.id, retryOf: run.id } });
     return Promise.resolve(started);
-  });
+  }, "transactional");
 }

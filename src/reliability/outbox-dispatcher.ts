@@ -8,12 +8,15 @@ function describeEvent(event: OutboxEvent, runStateOf: (taskId: string) => { id:
   const taskId = String(payload.taskId ?? event.taskId ?? "");
   const runId = String(payload.runId ?? event.workflowRunId ?? "");
   const ids = `task ${taskId.slice(0, 8)} · run ${runId.slice(0, 8)}`;
+  // Gate suffix binds an IM decision to the exact gate the notification is
+  // about — a stale card must not decide the next gate.
+  const gateSuffix = typeof payload.gateStepId === "string" ? ` ${payload.gateStepId.slice(0, 8)}` : "";
   switch (event.type) {
     case "run.succeeded": return `Task ${taskId.slice(0, 8)} finished: SUCCEEDED (run ${runId.slice(0, 8)})`;
     case "run.failed": return `Task ${taskId.slice(0, 8)} finished: FAILED (run ${runId.slice(0, 8)})`;
     case "run.cancelled": return `Task ${taskId.slice(0, 8)} cancelled (run ${runId.slice(0, 8)})`;
     case "task.timeout": return `Task ${taskId.slice(0, 8)} timed out and was cancelled.`;
-    case "approval.requested": return `Approval needed: ${ids}\n/approve ${runId} or /reject ${runId}`;
+    case "approval.requested": return `Approval needed: ${ids}\n/approve ${runId}${gateSuffix} or /reject ${runId}${gateSuffix}`;
     case "fix.started": return `Fix workflow started for CI/review failures (task ${taskId.slice(0, 8)}, run ${runId.slice(0, 8)}).`;
     case "task.orphan-recovered": return `Task ${taskId.slice(0, 8)} recovered after a worker crash; check its state.`;
     case "run.worker-error": {

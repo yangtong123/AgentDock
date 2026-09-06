@@ -1,4 +1,4 @@
-import type { Database } from "../db/database.js";
+import { withImmediateTransaction, type Database } from "../db/database.js";
 
 /**
  * Idempotency guard for commands: the same logical command (keyed by the
@@ -82,8 +82,7 @@ export class TransactionalOutbox {
   claimBatch(worker: string, limit: number, claimTtlMs = DEFAULT_CLAIM_TTL_MS): OutboxEvent[] {
     const now = this.now();
     const claimExpiresAt = new Date(Date.parse(now) + claimTtlMs).toISOString();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    return withImmediateTransaction(this.db, () => {
       const rows = this.db.prepare(
         `SELECT * FROM outbox_events
          WHERE processed_at IS NULL
@@ -92,12 +91,8 @@ export class TransactionalOutbox {
       ).all(now, limit) as (Record<string, unknown>)[];
       const claim = this.db.prepare("UPDATE outbox_events SET processed_by = ?, claim_expires_at = ? WHERE id = ?");
       for (const row of rows) claim.run(worker, claimExpiresAt, Number(row.id));
-      this.db.exec("COMMIT");
       return rows.map((row) => this.toEvent(row));
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   /**
@@ -136,22 +131,16 @@ export class LeaseManager {
   acquire(leaseKey: string, owner: string, taskId: string, ttlMs: number): boolean {
     const now = this.clock.now();
     const expiresAt = new Date(now.getTime() + ttlMs).toISOString();
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    return withImmediateTransaction(this.db, () => {
       const existing = this.db.prepare("SELECT owner, expires_at FROM worker_leases WHERE lease_key = ?").get(leaseKey) as { owner: string; expires_at: string } | undefined;
       if (existing && existing.owner !== owner && new Date(existing.expires_at).getTime() > now.getTime()) {
-        this.db.exec("COMMIT");
         return false; // held by a live someone else
       }
       this.db.prepare(`INSERT INTO worker_leases (lease_key, owner, task_id, acquired_at, expires_at) VALUES (?,?,?,?,?)
         ON CONFLICT (lease_key) DO UPDATE SET owner = excluded.owner, task_id = excluded.task_id, acquired_at = excluded.acquired_at, expires_at = excluded.expires_at`)
         .run(leaseKey, owner, taskId, now.toISOString(), expiresAt);
-      this.db.exec("COMMIT");
       return true;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   /** Heartbeat = conditional renewal: only a still-live lease owned by this

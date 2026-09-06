@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Database } from "../db/database.js";
-import { withImmediateTransaction } from "../db/database.js";
+import { withImmediateTransaction, type Database } from "../db/database.js";
 import type { Application } from "../app/application.js";
 import { LeaseManager, TransactionalOutbox, CommandDedup, SystemClock, type Clock } from "./outbox.js";
 import { TaskQueue } from "./task-queue.js";
@@ -111,8 +110,10 @@ export class Orchestrator {
    * task is not an orphan.
    */
   recoverIfOrphaned(taskId: string): { taskId: string; runId: string | null } | null {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    // withImmediateTransaction (not a hand-rolled BEGIN): the recovery writes
+    // record activity through the engine, and pokes for uncommitted events
+    // must defer to COMMIT — a raw transaction would leak them to SSE.
+    return withImmediateTransaction(this.db, () => {
       const task = this.app.repositories.tasks.findById(taskId);
       const openRuns = this.db.prepare(`SELECT r.id FROM workflow_runs r
         JOIN task_revisions rev ON r.task_revision_id = rev.id
@@ -125,7 +126,7 @@ export class Orchestrator {
                           AND NOT EXISTS (SELECT 1 FROM step_runs p WHERE p.workflow_run_id = r.id
                                           AND p.sequence < g.sequence AND p.state NOT IN ('SUCCEEDED')))`).all(taskId) as { id: string }[];
       const live = this.db.prepare("SELECT lease_key FROM worker_leases WHERE task_id = ? AND expires_at > ?").get(taskId, this.clock.now().toISOString());
-      if (task === undefined || openRuns.length === 0 || live) { this.db.exec("COMMIT"); return null; }
+      if (task === undefined || openRuns.length === 0 || live) return null;
       // No live lease: the worker died. Cancel the open runs and settle the
       // task — a task the user asked to cancel settles CANCELLED, a crashed
       // one FAILED.
@@ -139,12 +140,8 @@ export class Orchestrator {
       const event = { taskId, type: "task.orphan-recovered" as const, payload: { taskId, runId } };
       if (runId !== null) this.outbox.publish({ ...event, workflowRunId: runId });
       else this.outbox.publish(event);
-      this.db.exec("COMMIT");
       return { taskId, runId };
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
+    });
   }
 
   /**

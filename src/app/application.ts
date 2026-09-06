@@ -29,7 +29,7 @@ export function createApplication(db:Database, options:{ agents?: Record<string,
   const agents:Record<string,CodingAgent>=options.agents??{claude:new ClaudeAgent(runner),codex:new CodexAgent(runner)};
   const artifactRoot=resolve(process.env.AGENTDOCK_ARTIFACTS??"./.agentdock/artifacts");
   const runtime=new AgentThreadManager(agentThreadRepository,artifactRepository,taskRepository,(provider)=>{ const agent=agents[provider]; if(!agent) throw new Error(`Unknown agent provider: ${provider}`); return agent; },artifactRoot);
-  const tasks=new TaskService(taskRepository,projectRepository);
+  const tasks=new TaskService(taskRepository,projectRepository,db);
   const worktrees=new WorktreeManager(taskRepository,projectRepository,git);
   const metrics=new MetricsService(db);
   const budget=new BudgetGuard(db,metrics);

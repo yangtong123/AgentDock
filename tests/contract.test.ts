@@ -154,6 +154,7 @@ test("approval gate notifies each subscribed conversation on its own adapter", a
     assert.ok(approvalNotices.some((n) => n.adapter === "feishu" && n.conversationId === "shared-1"));
     const runId = (f.db.prepare("SELECT wr.id FROM workflow_runs wr JOIN task_revisions tr ON wr.task_revision_id = tr.id WHERE tr.task_id = ?").get(taskId) as { id: string }).id;
     assert.ok(approvalNotices.every((n) => n.text.includes(`/approve ${runId}`)), "the notification carries the actionable run id");
+    assert.ok(approvalNotices.every((n) => new RegExp(`/approve ${runId} \\S{8}`).test(n.text)), "the notification carries the gate suffix that binds the decision");
   } finally { await f.cleanup(); }
 });
 
@@ -321,5 +322,34 @@ test("approval sweep is per gate: gate 1's delivered notification must not silen
     assert.ok(f.orchestrator!.notifyParkedApprovalGates() >= 1, "sweep republishes gate 2 despite gate 1's existing notification");
     assert.equal(countForGate(gate2.id), 1, "gate 2 notification exists exactly once");
     assert.equal(f.orchestrator!.notifyParkedApprovalGates() === 0 || countForGate(gate2.id) === 1, true, "second sweep does not duplicate gate 2");
+  } finally { await f.cleanup(); }
+});
+
+test("IM approval binds to the gate: a stale gate prefix conflicts, the current one proceeds", async () => {
+  const f = fixture({ withOrchestrator: true });
+  try {
+    const projectId = project(f);
+    const { task } = f.app.tasks.create(projectId, "im gate binding");
+    await f.app.worktrees.prepare(task.id);
+    const started = f.app.workflows.start({ taskId: task.id, preset: "careful" });
+    await f.app.workflows.execute(started.run.id); // park at gate 1
+    const gates = f.app.repositories.workflows.listSteps(started.run.id).filter((s) => s.stepType === "HUMAN_APPROVAL");
+    assert.equal(gates.length, 2);
+    const gate1 = gates[0]!;
+    const gate2 = gates[1]!;
+
+    // Stale card for gate 2 while gate 1 is pending: the controller surfaces
+    // the conflict as an error reply, and gate 1 stays pending.
+    const stale = await f.controller.handle({ type: "APPROVE_RUN", conversationId: "c1", runId: started.run.id, approved: true, gatePrefix: gate2.id.slice(0, 8) }, "telegram");
+    assert.match(stale.text, /Error: .*awaiting gate/);
+    assert.equal(f.app.workflows.pendingApprovalGate(started.run.id)?.id, gate1.id);
+
+    // An unresolvable prefix is a clear error, not a silent bypass.
+    const unknown = await f.controller.handle({ type: "APPROVE_RUN", conversationId: "c1", runId: started.run.id, approved: true, gatePrefix: "deadbeef" }, "telegram");
+    assert.match(unknown.text, /Unknown gate deadbeef/);
+
+    // The notification's own prefix decides the pending gate.
+    const resumed = await f.controller.handle({ type: "APPROVE_RUN", conversationId: "c1", runId: started.run.id, approved: true, gatePrefix: gate1.id.slice(0, 8) }, "telegram");
+    assert.match(resumed.text, /resumed/);
   } finally { await f.cleanup(); }
 });

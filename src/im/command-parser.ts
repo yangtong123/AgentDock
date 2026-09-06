@@ -66,12 +66,17 @@ export function parseCommand(conversationId: string, text: string): ImCommand | 
     case "/approve": {
       const runId = rest[0] ?? "";
       if (!runId) return null;
-      return { type: "APPROVE_RUN", conversationId, runId, approved: true };
+      // Optional gate suffix (first 8 chars of the gate step id — included in
+      // approval notifications): binds the decision to THAT gate so a stale
+      // card or command cannot decide the next one.
+      const gatePrefix = rest[1];
+      return { type: "APPROVE_RUN", conversationId, runId, approved: true, ...(gatePrefix !== undefined ? { gatePrefix } : {}) };
     }
     case "/reject": {
       const runId = rest[0] ?? "";
       if (!runId) return null;
-      return { type: "APPROVE_RUN", conversationId, runId, approved: false };
+      const gatePrefix = rest[1];
+      return { type: "APPROVE_RUN", conversationId, runId, approved: false, ...(gatePrefix !== undefined ? { gatePrefix } : {}) };
     }
     case "/diff": {
       if (!argument) return null;

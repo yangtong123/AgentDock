@@ -1,4 +1,4 @@
-import type { Database } from "../db/database.js";
+import { withImmediateTransaction, type Database } from "../db/database.js";
 import type { RunState, StepRun, StepType, WorkflowRun } from "../shared/domain.js";
 import { NotFoundError } from "../shared/domain.js";
 type WorkflowRow={id:string;task_revision_id:string;preset:string|null;state:RunState;max_review_rounds:number;step_timeout_ms:number;created_at:string;updated_at:string};
@@ -30,13 +30,11 @@ export class SqliteWorkflowRepository implements WorkflowRepository {
     // Single transaction: a crash can never leave the sequences half-rewritten.
     const timestamp=new Date().toISOString();
     const offset=orderedIds.length;
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+    withImmediateTransaction(this.db, () => {
       const bump=this.db.prepare("UPDATE step_runs SET sequence = sequence + ? WHERE workflow_run_id = ?");
       bump.run(offset,workflowRunId);
       const setSequence=this.db.prepare("UPDATE step_runs SET sequence = ?, updated_at = ? WHERE id = ?");
       for (const [index,id] of orderedIds.entries()) setSequence.run(index,timestamp,id);
-      this.db.exec("COMMIT");
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    });
   }
 }

@@ -200,11 +200,13 @@ export class ImController {
             const started = this.app.workflows.start(startInput);
             this.audit.record({ actor, action: "run.start", taskId: command.taskId, detail: { runId: started.run.id, preset: command.preset } });
             const status = await this.app.workflows.execute(started.run.id);
+            const gate = status.awaitingApproval ? this.app.workflows.pendingApprovalGate(started.run.id)?.id.slice(0, 8) : undefined;
+            const approveCmd = (approved: boolean) => ({ type: "APPROVE_RUN" as const, conversationId: command.conversationId, runId: started.run.id, approved, ...(gate !== undefined ? { gatePrefix: gate } : {}) });
             return respond(status.awaitingApproval
-              ? `Run ${started.run.id} paused for your approval.\n/approve ${started.run.id} or /reject ${started.run.id}`
+              ? `Run ${started.run.id} paused for your approval.\n/approve ${started.run.id}${gate ? ` ${gate}` : ""} or /reject ${started.run.id}${gate ? ` ${gate}` : ""}`
               : `Run ${started.run.id} finished: ${status.run.state}.`, status.awaitingApproval ? [
-                { label: "Approve", command: { type: "APPROVE_RUN", conversationId: command.conversationId, runId: started.run.id, approved: true } },
-                { label: "Reject", command: { type: "APPROVE_RUN", conversationId: command.conversationId, runId: started.run.id, approved: false } },
+                { label: "Approve", command: approveCmd(true) },
+                { label: "Reject", command: approveCmd(false) },
               ] : undefined);
           } catch (error) {
             return respond(`Error: ${error instanceof Error ? error.message : String(error)}`);
@@ -214,9 +216,11 @@ export class ImController {
           const details = this.app.tasks.show(command.taskId);
           const run = this.activeRunFor(command.taskId);
           if (run?.awaitingApproval) {
-            return respond(`Task ${command.taskId} (${details.task.state}) is awaiting your approval — run ${run.run.id}.\n/approve ${run.run.id} or /reject ${run.run.id}`, [
-              { label: "Approve", command: { type: "APPROVE_RUN", conversationId: command.conversationId, runId: run.run.id, approved: true } },
-              { label: "Reject", command: { type: "APPROVE_RUN", conversationId: command.conversationId, runId: run.run.id, approved: false } },
+            const gate = this.app.workflows.pendingApprovalGate(run.run.id)?.id.slice(0, 8);
+            const approveCmd = (approved: boolean) => ({ type: "APPROVE_RUN" as const, conversationId: command.conversationId, runId: run.run.id, approved, ...(gate !== undefined ? { gatePrefix: gate } : {}) });
+            return respond(`Task ${command.taskId} (${details.task.state}) is awaiting your approval — run ${run.run.id}.\n/approve ${run.run.id}${gate ? ` ${gate}` : ""} or /reject ${run.run.id}${gate ? ` ${gate}` : ""}`, [
+              { label: "Approve", command: approveCmd(true) },
+              { label: "Reject", command: approveCmd(false) },
             ]);
           }
           if (run && run.run.state === "RUNNING" && run.steps.some((s) => s.state === "RUNNING" && s.stepType === "HUMAN_APPROVAL")) {
@@ -243,16 +247,24 @@ export class ImController {
           return respond(`Subscribed to task ${task.id} (${task.state})${run ? ` · run ${run.run.id} (${run.run.state})` : ""}. Notifications will be delivered to this conversation.`);
         }
         case "APPROVE_RUN": {
+          // A gate prefix from the notification/card binds the decision to
+          // THAT gate; without it a stale card for gate 1 could decide gate 2.
+          let expectedApprovalStepId: string | undefined;
+          if (command.gatePrefix !== undefined) {
+            const gate = this.app.repositories.workflows.listSteps(command.runId).find((step) => step.id.startsWith(command.gatePrefix!));
+            if (gate === undefined) return respond(`Unknown gate ${command.gatePrefix} for run ${command.runId}.`);
+            expectedApprovalStepId = gate.id;
+          }
           if (!command.approved) {
             // Reject goes through the shared command handler: audit + activity included.
-            await approveRun(this.commands(), { runId: command.runId, approved: false, actor });
+            await approveRun(this.commands(), { runId: command.runId, approved: false, ...(expectedApprovalStepId !== undefined ? { expectedApprovalStepId } : {}), actor });
             return respond(`Rejected. The workflow is cancelled (run ${command.runId}).`);
           }
           if (this.orchestrator !== null) {
             // Shared handler: approve + re-enqueue commit atomically. The
             // subscription follows immediately — it is notification routing,
             // not part of the recovery invariant (start+enqueue).
-            await approveRun(this.commands(), { runId: command.runId, approved: true, actor });
+            await approveRun(this.commands(), { runId: command.runId, approved: true, ...(expectedApprovalStepId !== undefined ? { expectedApprovalStepId } : {}), actor });
             const taskId = this.taskIdForRun(command.runId);
             if (taskId !== null) {
               this.trackTaskInterest(command.conversationId, taskId, this.originAdapterOf(command.conversationId) ?? null);

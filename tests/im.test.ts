@@ -25,6 +25,8 @@ test("parser maps /commands to domain commands and ignores chat", () => {
   assert.equal(parseCommand(conversationId, "/watch"), null);
   assert.deepEqual(parseCommand(conversationId, "/diff t1 --stat"), { type: "VIEW_DIFF", conversationId, taskId: "t1", statOnly: true });
   assert.deepEqual(parseCommand(conversationId, "/approve r1"), { type: "APPROVE_RUN", conversationId, runId: "r1", approved: true });
+  assert.deepEqual(parseCommand(conversationId, "/approve r1 ab12cd34"), { type: "APPROVE_RUN", conversationId, runId: "r1", approved: true, gatePrefix: "ab12cd34" });
+  assert.deepEqual(parseCommand(conversationId, "/reject r1 ab12cd34"), { type: "APPROVE_RUN", conversationId, runId: "r1", approved: false, gatePrefix: "ab12cd34" });
   assert.deepEqual(parseCommand(conversationId, "/reject r1"), { type: "APPROVE_RUN", conversationId, runId: "r1", approved: false });
   assert.equal(parseCommand(conversationId, "/approve"), null);
   assert.deepEqual(parseCommand(conversationId, "/start"), { type: "LIST_PROJECTS", conversationId });

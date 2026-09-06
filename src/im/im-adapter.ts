@@ -11,7 +11,7 @@ export type ImCommand =
   | { type: "TASK_STATUS"; conversationId: string; taskId: string }
   | { type: "STOP_TASK"; conversationId: string; taskId: string }
   | { type: "WATCH_TASK"; conversationId: string; taskId: string }
-  | { type: "APPROVE_RUN"; conversationId: string; runId: string; approved: boolean }
+  | { type: "APPROVE_RUN"; conversationId: string; runId: string; approved: boolean; gatePrefix?: string }
   | { type: "CONTINUE_RUN"; conversationId: string; runId: string }
   | { type: "VIEW_DIFF"; conversationId: string; taskId: string; statOnly: boolean };
 

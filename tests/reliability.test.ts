@@ -16,15 +16,25 @@ function fakeClock(startMs: number): Clock & { advance(ms: number): void } {
 
 function freshDb(): Database { return openDatabase(":memory:"); }
 
-test("withImmediateTransaction commits atomically and rejects nested re-entry on the same connection", () => {
+test("withImmediateTransaction commits atomically; nested calls join the outer transaction", () => {
   const db = freshDb();
   const queue = new TaskQueue(db);
   assert.equal(withImmediateTransaction(db, () => { queue.enqueue("t1"); return "ok" }), "ok");
   assert.equal(queue.size(), 1);
-  // A nested BEGIN IMMEDIATE on the same connection must fail and roll back
-  // the outer transaction body — never leave half of a compound operation.
-  assert.throws(() => withImmediateTransaction(db, () => { queue.enqueue("t2"); withImmediateTransaction(db, () => undefined); }), /transaction/);
-  assert.equal(queue.size(), 1, "outer body rolled back with the failed nested transaction");
+  // Nested calls join the outer transaction (no nested BEGIN): inner writes
+  // commit together with the outer ones.
+  withImmediateTransaction(db, () => {
+    queue.enqueue("t2");
+    withImmediateTransaction(db, () => { queue.enqueue("t3"); });
+  });
+  assert.equal(queue.size(), 3);
+  // An inner failure unwinds the whole joined transaction — never half of a
+  // compound operation.
+  assert.throws(() => withImmediateTransaction(db, () => {
+    queue.enqueue("t4");
+    withImmediateTransaction(db, () => { throw new Error("inner boom"); });
+  }), /inner boom/);
+  assert.equal(queue.size(), 3, "outer body rolled back with the failed inner call");
   db.close();
 });
 
